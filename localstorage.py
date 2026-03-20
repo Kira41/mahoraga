@@ -1,11 +1,192 @@
-from flask import Flask, request, jsonify, render_template_string
+import base64
+import posixpath
+import re
 import sqlite3
 import json
 from pathlib import Path
+from typing import List
+
+import paramiko
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 DB_PATH = Path(__file__).with_suffix('.db')
 STORAGE_KEY = 'mailInfraDashboardDataV4'
+REMOTE_BASE_DIR = '/root'
+DOMAIN_RE = re.compile(r'^(?=.{1,253}$)(?!-)([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$')
+SELECTOR_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$')
+
+
+def is_valid_domain_name(value: str) -> bool:
+    return bool(DOMAIN_RE.match((value or '').strip().lower()))
+
+
+def is_valid_selector_name(value: str) -> bool:
+    return bool(SELECTOR_RE.match((value or '').strip()))
+
+
+def generate_dkim_keypair_local(key_size: int = 2048):
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=key_size)
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_der = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    public_b64 = base64.b64encode(public_der).decode('ascii')
+    return private_pem, public_b64
+
+
+def split_for_dns(value: str, chunk: int = 200) -> str:
+    parts = [value[i:i + chunk] for i in range(0, len(value), chunk)]
+    return ' '.join([f'"{part}"' for part in parts])
+
+
+def ssh_connect_sftp(host: str, port: int, user: str, password: str, timeout: int = 20):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname=host,
+        port=port,
+        username=user,
+        password=password,
+        timeout=timeout,
+        banner_timeout=timeout,
+        auth_timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
+    )
+    sftp = client.open_sftp()
+    return client, sftp
+
+
+def sftp_mkdirs(sftp: paramiko.SFTPClient, path: str):
+    path = (path or '').replace('\\', '/').strip()
+    if not path:
+        return
+
+    is_abs = path.startswith('/')
+    parts = [part for part in path.split('/') if part]
+    current = '/' if is_abs else '.'
+    for part in parts:
+        nxt = posixpath.join(current, part) if current != '.' else part
+        try:
+            sftp.stat(nxt)
+        except Exception:
+            sftp.mkdir(nxt)
+        current = nxt
+
+
+def sftp_upload_bytes(sftp: paramiko.SFTPClient, remote_path: str, data: bytes):
+    remote_path = (remote_path or '').replace('\\', '/').strip()
+    if not remote_path:
+        raise ValueError('Empty remote path.')
+
+    remote_dir = posixpath.dirname(remote_path)
+    if remote_dir and remote_dir not in ('.', '/'):
+        sftp_mkdirs(sftp, remote_dir)
+
+    with sftp.open(remote_path, 'wb') as file_handle:
+        file_handle.write(data)
+
+
+def clean_int(value, default: int) -> int:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+
+def run_dkim_generation(payload: dict):
+    ssh_host = (payload.get('sshHost') or '').strip()
+    ssh_user = (payload.get('sshUser') or '').strip()
+    ssh_pass = payload.get('sshPass') or ''
+    ssh_port = clean_int(payload.get('sshPort', 22), 22)
+    ssh_timeout = clean_int(payload.get('sshTimeout', 20), 20)
+    dkim_filename = (payload.get('dkimFilename') or 'dkim.pem').strip() or 'dkim.pem'
+    key_size = clean_int(payload.get('keySize', 2048), 2048)
+
+    if key_size not in (1024, 2048, 4096):
+        raise ValueError('Key size must be 1024, 2048, or 4096.')
+    if not ssh_host or not ssh_user:
+        raise ValueError('Missing SSH host or username.')
+
+    raw_domains = payload.get('domains') or []
+    pairs: List[tuple[str, str]] = []
+    for item in raw_domains:
+        if not isinstance(item, dict):
+            continue
+        domain = (item.get('domain') or '').strip().lower()
+        selector = (item.get('selector') or 'dkim').strip() or 'dkim'
+        if domain:
+            pairs.append((domain, selector))
+
+    if not pairs:
+        raise ValueError('Please provide at least one domain.')
+
+    client = None
+    sftp = None
+    results = []
+    try:
+        client, sftp = ssh_connect_sftp(ssh_host, ssh_port, ssh_user, ssh_pass, timeout=ssh_timeout)
+        for domain, selector in pairs:
+            try:
+                if not is_valid_domain_name(domain):
+                    raise ValueError(f'Invalid domain format: {domain}')
+                if not is_valid_selector_name(selector):
+                    raise ValueError(f'Invalid selector format: {selector}')
+
+                private_pem, public_b64 = generate_dkim_keypair_local(key_size=key_size)
+                remote_dir = posixpath.join(REMOTE_BASE_DIR.rstrip('/'), domain)
+                remote_path = posixpath.join(remote_dir, dkim_filename)
+                sftp_upload_bytes(sftp, remote_path, private_pem)
+
+                record_value = f'v=DKIM1; k=rsa; p={public_b64}'
+                results.append({
+                    'domain': domain,
+                    'selector': selector,
+                    'remotePath': remote_path,
+                    'recordHostShort': f'{selector}._domainkey',
+                    'recordHostFull': f'{selector}._domainkey.{domain}',
+                    'recordValue': record_value,
+                    'recordValueSplit': split_for_dns(record_value, chunk=200),
+                    'publicKey': public_b64,
+                    'ok': True,
+                })
+            except Exception as exc:
+                results.append({
+                    'domain': domain or '(empty)',
+                    'selector': selector or '(empty)',
+                    'remotePath': '',
+                    'recordHostShort': f'{selector}._domainkey' if selector else '',
+                    'recordHostFull': f'{selector}._domainkey.{domain}' if selector and domain else '',
+                    'recordValue': '',
+                    'recordValueSplit': '',
+                    'publicKey': '',
+                    'ok': False,
+                    'error': str(exc),
+                })
+        return {
+            'ok': True,
+            'sshSummary': f'Connected to {ssh_host}:{ssh_port} (SFTP).',
+            'items': results,
+        }
+    finally:
+        try:
+            if sftp:
+                sftp.close()
+        except Exception:
+            pass
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
 
 HTML = r'''<!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -331,6 +512,12 @@ HTML = r'''<!DOCTYPE html>
       box-shadow: 0 30px 80px rgba(0,0,0,.45);
       overflow: hidden;
     }
+    .modal.modal-xl {
+      width: min(1380px, 100%);
+      max-height: calc(100vh - 48px);
+      display: flex;
+      flex-direction: column;
+    }
     .modal-header {
       display: flex;
       align-items: flex-start;
@@ -352,6 +539,9 @@ HTML = r'''<!DOCTYPE html>
       box-shadow: none;
     }
     .modal-body { padding: 20px; }
+    .modal.modal-xl .modal-body {
+      overflow: auto;
+    }
     .modal-actions {
       display: flex;
       gap: 10px;
@@ -371,6 +561,44 @@ HTML = r'''<!DOCTYPE html>
       flex-wrap: wrap;
       margin-top: 14px;
     }
+    .bulk-dkim-grid { display: grid; gap: 16px; }
+    .bulk-dkim-results { display: grid; gap: 12px; }
+    .bulk-dkim-item {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #0f1728;
+      padding: 14px;
+    }
+    .bulk-dkim-item .kv-row strong,
+    .bulk-dkim-item pre {
+      direction: ltr;
+      text-align: left;
+    }
+    .bulk-dkim-table { width: 100%; border-collapse: collapse; }
+    .bulk-dkim-table th, .bulk-dkim-table td {
+      border-bottom: 1px solid rgba(255,255,255,.06);
+      padding: 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    .bulk-dkim-table th {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }
+    .bulk-dkim-table input { min-width: 0; }
+    .bulk-dkim-table .btn-danger { width: 100%; }
+    .bulk-dkim-copy-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    .pre-box {
+      margin-top: 8px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #0b1220;
+      padding: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
 
     @media (max-width: 1200px) {
       .grid-4, .row, .qm-layout, .overview-grid, .registry-monitor { grid-template-columns: 1fr; }
@@ -389,7 +617,7 @@ HTML = r'''<!DOCTYPE html>
         <button id="importBtn">Import JSON</button>
         <button id="seedBtn">Load Sample Data</button>
         <button id="domainsRegistryBtn">Domains</button>
-        <button id="resetBtn" class="btn-danger">Clear All Database Data</button>
+        <button id="bulkDkimBtn" class="btn-danger">Bulk DKIM generator</button>
       </div>
     </div>
 
@@ -602,6 +830,25 @@ HTML = r'''<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="modal-overlay" id="bulkDkimOverlay">
+    <div class="modal modal-xl">
+      <div class="modal-header">
+        <div>
+          <h3>Bulk DKIM generator</h3>
+          <p>Standalone DKIM generator injected into the dashboard. It reuses the selected server SSH settings when available and can generate/upload one or many DKIM keys.</p>
+        </div>
+        <button id="bulkDkimCloseBtn" class="modal-close">×</button>
+      </div>
+      <div class="modal-body">
+        <div id="bulkDkimNotice" class="notice">Ready.</div>
+        <div id="bulkDkimContent" style="margin-top:16px;"></div>
+      </div>
+      <div class="modal-actions">
+        <button id="bulkDkimCloseFooterBtn">Close</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     document.addEventListener('DOMContentLoaded', async () => {
       const state = {
@@ -617,6 +864,7 @@ HTML = r'''<!DOCTYPE html>
         registryPage: 1,
         registryPageSize: 5,
         modalMode: null,
+        bulkDkimResults: null,
       };
 
       async function apiGetData() {
@@ -639,6 +887,28 @@ HTML = r'''<!DOCTYPE html>
         const response = await fetch('/api/data', { method: 'DELETE' });
         if (!response.ok) throw new Error('Failed to clear backend data');
         return await response.json();
+      }
+
+      async function apiCheckSsh(payload) {
+        const response = await fetch('/api/dkim/check-ssh', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'SSH check failed');
+        return data;
+      }
+
+      async function apiGenerateDkim(payload) {
+        const response = await fetch('/api/dkim/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'DKIM generation failed');
+        return data;
       }
 
       function uid(prefix = 'id') {
@@ -668,6 +938,41 @@ HTML = r'''<!DOCTYPE html>
       async function saveData() {
         await apiSaveData(state.data);
         renderAll();
+      }
+
+      function getServerById(serverId = '') {
+        return state.data?.servers?.find(server => server.id === serverId) || null;
+      }
+
+      function getServerSshSettings(server = null) {
+        return {
+          sshHost: server?.sshHost || '',
+          sshPort: String(server?.sshPort || 22),
+          sshTimeout: String(server?.sshTimeout || 20),
+          sshUser: server?.sshUser || '',
+          sshPass: server?.sshPass || '',
+          dkimFilename: server?.dkimFilename || 'dkim.pem',
+          keySize: String(server?.keySize || 2048),
+        };
+      }
+
+      function collectSshSettingsFromForm() {
+        return {
+          sshHost: document.getElementById('serverSshHost')?.value.trim() || '',
+          sshPort: document.getElementById('serverSshPort')?.value.trim() || '22',
+          sshTimeout: document.getElementById('serverSshTimeout')?.value.trim() || '20',
+          sshUser: document.getElementById('serverSshUser')?.value.trim() || '',
+          sshPass: document.getElementById('serverSshPass')?.value || '',
+          dkimFilename: document.getElementById('serverDkimFilename')?.value.trim() || 'dkim.pem',
+          keySize: document.getElementById('serverKeySize')?.value || '2048',
+        };
+      }
+
+      function validateSshSettings(settings) {
+        if (!settings.sshHost) throw new Error('Please enter SSH host');
+        if (!settings.sshUser) throw new Error('Please enter SSH username');
+        if (!settings.sshPass) throw new Error('Please enter SSH password');
+        return settings;
       }
 
       function escapeHtml(str = '') {
@@ -779,6 +1084,214 @@ HTML = r'''<!DOCTYPE html>
         notice.textContent = message;
       }
 
+      function setBulkDkimNotice(message, type = 'default') {
+        const notice = document.getElementById('bulkDkimNotice');
+        if (!notice) return;
+        notice.className = type === 'ok' ? 'notice ok' : type === 'warn' ? 'notice warn' : type === 'err' ? 'notice err' : 'notice';
+        notice.textContent = message;
+      }
+
+      function closeBulkDkimModal() {
+        document.getElementById('bulkDkimOverlay')?.classList.remove('show');
+        setBulkDkimNotice('Ready.');
+      }
+
+      function getBulkDkimDefaultDomains(server = null) {
+        if (!server) return [{ domain: '', selector: 'dkim' }];
+        const linked = state.data.domains
+          .filter(domain => domain.serverId === server.id)
+          .map(domain => ({ domain: domain.domain || '', selector: domain.selector || 'dkim' }));
+        const drafts = state.data.ips
+          .filter(ip => ip.serverId === server.id)
+          .map(ip => state.data.domainDraftsByIp?.[ip.id])
+          .filter(Boolean)
+          .map(draft => ({ domain: draft.domain || '', selector: draft.selector || 'dkim' }));
+        const merged = [...linked, ...drafts].filter(item => item.domain);
+        const unique = [];
+        const seen = new Set();
+        merged.forEach(item => {
+          const key = `${normalizeDomain(item.domain)}__${item.selector || 'dkim'}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            unique.push({ domain: normalizeDomain(item.domain), selector: item.selector || 'dkim' });
+          }
+        });
+        return unique.length ? unique : [{ domain: '', selector: 'dkim' }];
+      }
+
+      function buildBulkDkimRows(rows = [{ domain: '', selector: 'dkim' }]) {
+        return rows.map((row, index) => `
+          <tr>
+            <td><input data-bulk-domain value="${escapeHtml(row.domain || '')}" placeholder="example.com" /></td>
+            <td><input data-bulk-selector value="${escapeHtml(row.selector || 'dkim')}" placeholder="dkim" /></td>
+            <td><button type="button" class="btn-danger" data-bulk-remove-row="${index}">Remove</button></td>
+          </tr>
+        `).join('');
+      }
+
+      function renderBulkDkimModal(server = null, rows = null) {
+        const content = document.getElementById('bulkDkimContent');
+        if (!content) return;
+        const ssh = getServerSshSettings(server);
+        const selectedServerId = server?.id || '';
+        const effectiveRows = rows || getBulkDkimDefaultDomains(server);
+        const bulkResults = state.bulkDkimResults;
+
+        content.innerHTML = `
+          <div class="bulk-dkim-grid">
+            <div class="card">
+              <h2>SSH / SFTP Settings</h2>
+              <div class="sub">These fields mirror DKIM generator settings. Save them in the server workspace to reuse them everywhere.</div>
+              <input id="bulkDkimServerId" type="hidden" value="${escapeHtml(selectedServerId)}" />
+              <div class="row" style="margin-top:12px;">
+                <div>
+                  <label>SSH Host</label>
+                  <input id="bulkSshHost" value="${escapeHtml(ssh.sshHost)}" placeholder="server.example.com" />
+                </div>
+                <div>
+                  <label>Port</label>
+                  <input id="bulkSshPort" type="number" value="${escapeHtml(ssh.sshPort)}" />
+                </div>
+              </div>
+              <div class="row" style="margin-top:12px;">
+                <div>
+                  <label>Timeout (sec)</label>
+                  <input id="bulkSshTimeout" type="number" value="${escapeHtml(ssh.sshTimeout)}" />
+                </div>
+                <div>
+                  <label>Username</label>
+                  <input id="bulkSshUser" value="${escapeHtml(ssh.sshUser)}" />
+                </div>
+              </div>
+              <div class="row" style="margin-top:12px;">
+                <div>
+                  <label>Password</label>
+                  <input id="bulkSshPass" type="password" value="${escapeHtml(ssh.sshPass)}" />
+                </div>
+                <div>
+                  <label>DKIM filename</label>
+                  <input id="bulkDkimFilename" value="${escapeHtml(ssh.dkimFilename)}" />
+                </div>
+              </div>
+              <div class="row" style="margin-top:12px;">
+                <div>
+                  <label>Key size</label>
+                  <select id="bulkKeySize">
+                    <option value="2048" ${ssh.keySize === '2048' ? 'selected' : ''}>2048 (recommended)</option>
+                    <option value="1024" ${ssh.keySize === '1024' ? 'selected' : ''}>1024 (legacy)</option>
+                    <option value="4096" ${ssh.keySize === '4096' ? 'selected' : ''}>4096</option>
+                  </select>
+                </div>
+                <div>
+                  <label>Selected Server</label>
+                  <input value="${escapeHtml(server?.name || 'No server selected')}" class="readonly" readonly />
+                </div>
+              </div>
+              <div class="inline-actions" style="margin-top:14px;">
+                <button id="bulkCheckSshBtn">Check SSH Connection</button>
+                <button id="bulkSaveToServerBtn" class="btn-warning" ${selectedServerId ? '' : 'disabled'}>Save SSH to Selected Server</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <h2>Domains + DKIM Selector</h2>
+              <div class="sub">Bulk mode keeps the original DKIM generator behavior. For PTR-driven workflow inside Quick Management, single-domain generation runs automatically.</div>
+              <table class="bulk-dkim-table">
+                <thead>
+                  <tr>
+                    <th>Domain</th>
+                    <th>Selector</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="bulkDkimRows">${buildBulkDkimRows(effectiveRows)}</tbody>
+              </table>
+              <div class="inline-actions" style="margin-top:14px;">
+                <button id="bulkAddRowBtn">+ Add domain</button>
+                <button id="bulkGenerateBtn" class="btn-primary">Generate + Upload</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <h2>Results</h2>
+              ${bulkResults?.items?.length ? `
+                <div class="sub">${escapeHtml(bulkResults.sshSummary || '')}</div>
+                <div class="bulk-dkim-results">
+                  ${bulkResults.items.map((item, index) => `
+                    <div class="bulk-dkim-item">
+                      <div class="kv">
+                        <div class="kv-row"><span>Domain</span><strong>${escapeHtml(item.domain)}</strong></div>
+                        <div class="kv-row"><span>Selector</span><strong>${escapeHtml(item.selector)}</strong></div>
+                        <div class="kv-row"><span>Private key path</span><strong>${escapeHtml(item.remotePath)}</strong></div>
+                        <div class="kv-row"><span>Status</span><strong>${item.ok ? 'Uploaded' : 'Failed'}</strong></div>
+                        ${item.error ? `<div class="kv-row"><span>Error</span><strong>${escapeHtml(item.error)}</strong></div>` : ''}
+                      </div>
+                      <div class="pre-box" id="bulkRecordHost_${index}">${escapeHtml(item.recordHostFull || '-')}</div>
+                      <div class="pre-box" id="bulkRecordValue_${index}">${escapeHtml(item.recordValue || '-')}</div>
+                      <div class="pre-box" id="bulkRecordSplit_${index}">${escapeHtml(item.recordValueSplit || '-')}</div>
+                      <div class="bulk-dkim-copy-row">
+                        <button data-copy-target="bulkRecordHost_${index}">Copy Host</button>
+                        <button data-copy-target="bulkRecordValue_${index}" class="btn-primary">Copy Value</button>
+                        <button data-copy-target="bulkRecordSplit_${index}">Copy Split</button>
+                      </div>
+                    </div>
+                  `).join('')}
+                </div>
+              ` : `<div class="notice">No generated rows yet.</div>`}
+            </div>
+          </div>
+        `;
+      }
+
+      function openBulkDkimModal() {
+        const server = getCurrentContextServer();
+        state.bulkDkimResults = null;
+        renderBulkDkimModal(server);
+        document.getElementById('bulkDkimOverlay')?.classList.add('show');
+        setBulkDkimNotice(server ? `Using SSH defaults from server: ${server.name}` : 'Open a server first to prefill SSH settings automatically.', server ? 'ok' : 'warn');
+      }
+
+      function collectBulkDkimPayload() {
+        const rows = Array.from(document.querySelectorAll('#bulkDkimRows tr')).map(row => ({
+          domain: row.querySelector('[data-bulk-domain]')?.value.trim() || '',
+          selector: row.querySelector('[data-bulk-selector]')?.value.trim() || 'dkim',
+        })).filter(item => item.domain);
+
+        return {
+          serverId: document.getElementById('bulkDkimServerId')?.value || '',
+          sshHost: document.getElementById('bulkSshHost')?.value.trim() || '',
+          sshPort: document.getElementById('bulkSshPort')?.value.trim() || '22',
+          sshTimeout: document.getElementById('bulkSshTimeout')?.value.trim() || '20',
+          sshUser: document.getElementById('bulkSshUser')?.value.trim() || '',
+          sshPass: document.getElementById('bulkSshPass')?.value || '',
+          dkimFilename: document.getElementById('bulkDkimFilename')?.value.trim() || 'dkim.pem',
+          keySize: document.getElementById('bulkKeySize')?.value || '2048',
+          domains: rows,
+        };
+      }
+
+      function writeSshSettingsToServer(serverId, payload) {
+        const server = getServerById(serverId);
+        if (!server) throw new Error('Select a server first');
+        server.sshHost = payload.sshHost;
+        server.sshPort = Number(payload.sshPort || 22);
+        server.sshTimeout = Number(payload.sshTimeout || 20);
+        server.sshUser = payload.sshUser;
+        server.sshPass = payload.sshPass;
+        server.dkimFilename = payload.dkimFilename || 'dkim.pem';
+        server.keySize = Number(payload.keySize || 2048);
+      }
+
+      async function generateSingleDkimForDomain(serverId, domain) {
+        const server = getServerById(serverId);
+        if (!server) throw new Error('Please select a server first');
+        const payload = { ...validateSshSettings(getServerSshSettings(server)), domains: [{ domain, selector: 'dkim' }] };
+        const result = await apiGenerateDkim(payload);
+        const item = result.items?.[0];
+        if (!item?.ok) throw new Error(item?.error || 'DKIM generation failed');
+        return item;
+      }
+
       function getCurrentExportJson() {
         return JSON.stringify(state.data, null, 2);
       }
@@ -791,6 +1304,12 @@ HTML = r'''<!DOCTYPE html>
         a.download = filename;
         a.click();
         URL.revokeObjectURL(url);
+      }
+
+      async function copyElementText(elementId) {
+        const text = document.getElementById(elementId)?.textContent?.trim() || '';
+        if (!text) throw new Error('Nothing to copy');
+        await navigator.clipboard.writeText(text);
       }
 
       function safeArray(value) {
@@ -1221,10 +1740,62 @@ HTML = r'''<!DOCTYPE html>
 
       function buildServerForm(server = null) {
         const expiryStatus = getServerExpiryStatus(server?.expiryDate || '');
+        const ssh = getServerSshSettings(server);
         return `
           ${buildWorkspaceNav('server', server)}
-          <div class="notice">Create a server root node. Provider account user helps identify which provider account owns this server.</div>
+          <div class="notice">Create a server root node. The SSH section is now embedded here because DKIM generation depends on the selected server connection.</div>
           <div class="divider"></div>
+          <h4>SSH / DKIM Settings</h4>
+          <div class="sub">These settings are reused by the Bulk DKIM generator and by the automatic single-domain DKIM generation triggered from PTR.</div>
+          <div class="row">
+            <div>
+              <label>SSH Host</label>
+              <input id="serverSshHost" placeholder="server.example.com" value="${escapeHtml(ssh.sshHost)}" />
+            </div>
+            <div>
+              <label>SSH Port</label>
+              <input id="serverSshPort" type="number" placeholder="22" value="${escapeHtml(ssh.sshPort)}" />
+            </div>
+          </div>
+          <div class="row" style="margin-top:12px;">
+            <div>
+              <label>SSH Timeout (sec)</label>
+              <input id="serverSshTimeout" type="number" placeholder="20" value="${escapeHtml(ssh.sshTimeout)}" />
+            </div>
+            <div>
+              <label>SSH Username</label>
+              <input id="serverSshUser" placeholder="root" value="${escapeHtml(ssh.sshUser)}" />
+            </div>
+          </div>
+          <div class="row" style="margin-top:12px;">
+            <div>
+              <label>SSH Password</label>
+              <input id="serverSshPass" type="password" value="${escapeHtml(ssh.sshPass)}" />
+            </div>
+            <div>
+              <label>DKIM filename</label>
+              <input id="serverDkimFilename" value="${escapeHtml(ssh.dkimFilename)}" />
+            </div>
+          </div>
+          <div class="row" style="margin-top:12px;">
+            <div>
+              <label>Key size</label>
+              <select id="serverKeySize">
+                <option value="2048" ${ssh.keySize === '2048' ? 'selected' : ''}>2048 (recommended)</option>
+                <option value="1024" ${ssh.keySize === '1024' ? 'selected' : ''}>1024 (legacy)</option>
+                <option value="4096" ${ssh.keySize === '4096' ? 'selected' : ''}>4096</option>
+              </select>
+            </div>
+            <div>
+              <label>SSH Connection Check</label>
+              <div class="inline-actions">
+                <button id="serverCheckSshBtn" type="button">Check SSH Connection</button>
+                <span id="serverSshStatus" class="status muted">Not checked</span>
+              </div>
+            </div>
+          </div>
+          <div class="divider"></div>
+          <h4>Server Details</h4>
           <div class="row">
             <div>
               <label>Server Name</label>
@@ -1303,7 +1874,7 @@ HTML = r'''<!DOCTYPE html>
         const effectiveIp = domain ? state.data.ips.find(ip => ip.id === domain.ipId) || null : preferredIp;
         return `
           ${buildWorkspaceNav('domain', effectiveServer)}
-          <div class="notice">This domain workspace is scoped automatically from the infrastructure tree. Paste the DKIM public key to complete the domain setup.</div>
+          <div class="notice">This domain workspace is scoped automatically from the infrastructure tree. DKIM now generates automatically from PTR using the selected server SSH settings, and you can regenerate it here if needed.</div>
           <div class="divider"></div>
           <div class="small muted">Context: ${escapeHtml(effectiveServer?.name || 'No server')} → ${escapeHtml(effectiveIp?.ip || 'No IP selected')} → Domain Workspace</div>
           <input id="domainServerSelect" type="hidden" value="${escapeHtml(effectiveServer?.id || '')}" />
@@ -1351,7 +1922,10 @@ HTML = r'''<!DOCTYPE html>
           </div>
           <div style="margin-top:12px;">
             <label>DKIM Public Key</label>
-            <textarea id="domainPublicKey" placeholder="Paste the DKIM public key here">${escapeHtml(domain?.publicKey || '')}</textarea>
+            <textarea id="domainPublicKey" placeholder="Generated DKIM public key will appear here">${escapeHtml(domain?.publicKey || '')}</textarea>
+          </div>
+          <div class="inline-actions" style="margin-top:12px;">
+            <button id="generateDomainDkimBtn" type="button">Generate DKIM From PTR Domain</button>
           </div>
           <div style="margin-top:12px;">
             <button id="addDomainBtn" class="btn-primary">${domain ? 'Save Domain' : 'Add Domain'}</button>
@@ -1426,7 +2000,7 @@ HTML = r'''<!DOCTYPE html>
                               <div class="tree-leaf-title ltr">${escapeHtml(draft.domain)}</div>
                               <div>${statusBadge('Draft', 'warn')}</div>
                             </div>
-                            <div class="tree-leaf-meta">Ready for domain completion. Paste the DKIM public key in the workspace and save.</div>
+                            <div class="tree-leaf-meta">Ready for domain completion. Review the generated DKIM public key in the workspace, then save.</div>
                           </div>
                         ` : `<div class="tree-leaf"><div class="tree-leaf-meta">No domain linked to this IP yet.</div></div>`}
                       </div>
@@ -1599,7 +2173,7 @@ HTML = r'''<!DOCTYPE html>
               <div class="kv-row"><span>HELO</span><strong class="ltr">${escapeHtml(ip.helo || '-')}</strong></div>
             </div>`;
           hierarchy.innerHTML = `<h4>Hierarchy</h4><div class="muted-box">Server <strong>${escapeHtml(server?.name || '-')}</strong> → IP <strong class="ltr">${escapeHtml(ip.ip)}</strong>${draft ? ` → Draft domain <strong class="ltr">${escapeHtml(draft.domain)}</strong>` : ''}</div>`;
-          domainsBox.innerHTML = `<h4>Linked Domains</h4>${domains.length ? `<div class="domain-list-compact">${domains.map(d => `<div class="domain-row"><div class="domain-row-top"><strong class="ltr">${escapeHtml(d.domain)}</strong>${statusBadgeByScore(getDomainReadiness(d).score)}</div><div class="tree-leaf-meta ltr">${escapeHtml(d.vmta || '-')}</div></div>`).join('')}</div>` : draft ? `<div class="muted-box">A draft domain is prepared for this IP: <strong class="ltr">${escapeHtml(draft.domain)}</strong>. Open the domain workspace, paste the DKIM public key, then save.</div>` : `<div class="muted-box">No domain linked to this IP yet.</div>`}`;
+          domainsBox.innerHTML = `<h4>Linked Domains</h4>${domains.length ? `<div class="domain-list-compact">${domains.map(d => `<div class="domain-row"><div class="domain-row-top"><strong class="ltr">${escapeHtml(d.domain)}</strong>${statusBadgeByScore(getDomainReadiness(d).score)}</div><div class="tree-leaf-meta ltr">${escapeHtml(d.vmta || '-')}</div></div>`).join('')}</div>` : draft ? `<div class="muted-box">A draft domain is prepared for this IP: <strong class="ltr">${escapeHtml(draft.domain)}</strong>. Open the domain workspace, review the generated DKIM public key, then save.</div>` : `<div class="muted-box">No domain linked to this IP yet.</div>`}`;
           health.innerHTML = `
             <h4>Health & Readiness</h4>
             <div class="kv">
@@ -1848,6 +2422,14 @@ HTML = r'''<!DOCTYPE html>
         };
       }
 
+      function attachDkimResultToDraft(draft, dkimResult) {
+        if (!draft || !dkimResult) return draft;
+        draft.selector = dkimResult.selector || 'dkim';
+        draft.pemPath = dkimResult.remotePath || draft.pemPath;
+        draft.publicKey = dkimResult.publicKey || draft.publicKey || '';
+        return draft;
+      }
+
       function deleteDomain(domainId) {
         const domain = state.data.domains.find(x => x.id === domainId);
         if (!domain) return;
@@ -1910,7 +2492,7 @@ HTML = r'''<!DOCTYPE html>
       }
 
       function clearDomainAutoFields() {
-        ['domainName','domainVmta','domainPtr','domainHelo','domainSpf','domainDmarc','domainPemPath','domainSelector'].forEach(id => {
+        ['domainName','domainVmta','domainPtr','domainHelo','domainSpf','domainDmarc','domainPemPath','domainSelector','domainPublicKey'].forEach(id => {
           const el = document.getElementById(id);
           if (el) el.value = id === 'domainSelector' ? 'dkim' : '';
         });
@@ -1955,11 +2537,30 @@ HTML = r'''<!DOCTYPE html>
           domainDmarc: draft.dmarc,
           domainPemPath: draft.pemPath,
           domainSelector: 'dkim',
+          domainPublicKey: draft.publicKey || '',
         };
         Object.entries(fields).forEach(([id, value]) => {
           const el = document.getElementById(id);
           if (el) el.value = value;
         });
+      }
+
+      async function checkServerSshFromWorkspace() {
+        try {
+          const payload = validateSshSettings(collectSshSettingsFromForm());
+          const result = await apiCheckSsh(payload);
+          const status = document.getElementById('serverSshStatus');
+          if (status) {
+            status.className = 'status ok';
+            status.textContent = result.message || 'Connected';
+          }
+        } catch (error) {
+          const status = document.getElementById('serverSshStatus');
+          if (status) {
+            status.className = 'status err';
+            status.textContent = error.message || 'SSH check failed';
+          }
+        }
       }
 
       async function addServer() {
@@ -1968,6 +2569,7 @@ HTML = r'''<!DOCTYPE html>
         const accountUser = document.getElementById('serverAccountUser')?.value.trim() || '';
         const expiryDate = document.getElementById('serverExpiryDate')?.value || '';
         const notes = document.getElementById('serverNotes')?.value.trim() || '';
+        const sshSettings = collectSshSettingsFromForm();
         if (!name) return alert('Please enter a server name');
 
         const editingServer = state.selected.type === 'server'
@@ -1980,9 +2582,33 @@ HTML = r'''<!DOCTYPE html>
           editingServer.accountUser = accountUser;
           editingServer.expiryDate = expiryDate;
           editingServer.notes = notes;
+          Object.assign(editingServer, {
+            sshHost: sshSettings.sshHost,
+            sshPort: Number(sshSettings.sshPort || 22),
+            sshTimeout: Number(sshSettings.sshTimeout || 20),
+            sshUser: sshSettings.sshUser,
+            sshPass: sshSettings.sshPass,
+            dkimFilename: sshSettings.dkimFilename,
+            keySize: Number(sshSettings.keySize || 2048),
+          });
           state.selected = { type: 'server', id: editingServer.id };
         } else {
-          const newServer = { id: uid('srv'), name, provider, expiryDate, accountUser, notes, createdAt: Date.now() };
+          const newServer = {
+            id: uid('srv'),
+            name,
+            provider,
+            expiryDate,
+            accountUser,
+            notes,
+            sshHost: sshSettings.sshHost,
+            sshPort: Number(sshSettings.sshPort || 22),
+            sshTimeout: Number(sshSettings.sshTimeout || 20),
+            sshUser: sshSettings.sshUser,
+            sshPass: sshSettings.sshPass,
+            dkimFilename: sshSettings.dkimFilename,
+            keySize: Number(sshSettings.keySize || 2048),
+            createdAt: Date.now(),
+          };
           state.data.servers.push(newServer);
           state.selected = { type: 'server', id: newServer.id };
         }
@@ -2016,9 +2642,17 @@ HTML = r'''<!DOCTYPE html>
         const label = labelInput || getNextIpLabel(serverId);
         if (!isValidDomain(extractedDomain)) return alert('PTR must contain a valid hostname such as mail.example.com');
 
+        let dkimResult = null;
+        try {
+          dkimResult = await generateSingleDkimForDomain(serverId, extractedDomain);
+        } catch (error) {
+          return alert(error.message || 'Automatic DKIM generation failed');
+        }
+
         if (editingIp) {
           const previousServerId = editingIp.serverId;
           const previousIpId = editingIp.id;
+          const previousExtractedDomain = editingIp.extractedDomain;
           editingIp.serverId = serverId;
           editingIp.ip = ip;
           editingIp.label = label;
@@ -2035,9 +2669,22 @@ HTML = r'''<!DOCTYPE html>
           const linkedDomains = state.data.domains.filter(x => x.ipId === previousIpId);
           if (!linkedDomains.length) {
             const draft = buildDomainDraftFromIp(serverId, editingIp);
-            if (draft) state.data.domainDraftsByIp[editingIp.id] = draft;
+            if (draft) state.data.domainDraftsByIp[editingIp.id] = attachDkimResultToDraft(draft, dkimResult);
           } else {
             delete state.data.domainDraftsByIp[editingIp.id];
+            linkedDomains.forEach(domain => {
+              if (!domain.domain || domain.domain === previousExtractedDomain) {
+                domain.domain = extractedDomain;
+                domain.vmta = generateVmtaName(extractedDomain);
+                domain.dmarc = generateDmarcValue(extractedDomain);
+              }
+              domain.helo = helo;
+              domain.spf = `v=spf1 ip4:${ip} ~all`;
+              domain.ptr = ptr;
+              domain.selector = dkimResult.selector || 'dkim';
+              domain.pemPath = dkimResult.remotePath || domain.pemPath;
+              domain.publicKey = dkimResult.publicKey || domain.publicKey || '';
+            });
           }
 
           if (previousServerId !== serverId) {
@@ -2048,7 +2695,7 @@ HTML = r'''<!DOCTYPE html>
           const ipRecord = { id: uid('ip'), serverId, ip, label, ptr, helo, extractedDomain, createdAt: Date.now() };
           state.data.ips.push(ipRecord);
           const draft = buildDomainDraftFromIp(serverId, ipRecord);
-          if (draft) state.data.domainDraftsByIp[ipRecord.id] = draft;
+          if (draft) state.data.domainDraftsByIp[ipRecord.id] = attachDkimResultToDraft(draft, dkimResult);
           state.selected = { type: 'ip', id: ipRecord.id };
         }
 
@@ -2074,7 +2721,7 @@ HTML = r'''<!DOCTYPE html>
         if (!ipId) return alert('Please select an IP from the selected server');
         if (!isValidDomain(domain)) return alert('Generated domain is invalid');
         if (!vmta) return alert('Generated Virtual MTA name is missing');
-        if (!publicKey) return alert('Please paste the DKIM public key');
+        if (!publicKey) return alert('Please generate or paste the DKIM public key');
 
         const editingDomain = state.selected.type === 'domain'
           ? state.data.domains.find(x => x.id === state.selected.id) || null
@@ -2110,6 +2757,25 @@ HTML = r'''<!DOCTYPE html>
         state.workspaceMode = 'auto';
         state.showWorkspace = true;
         await saveData();
+      }
+
+      async function regenerateCurrentDomainDkim() {
+        const serverId = document.getElementById('domainServerSelect')?.value || '';
+        const domain = normalizeDomain(document.getElementById('domainName')?.value || '');
+        if (!serverId) return alert('Please select a server');
+        if (!isValidDomain(domain)) return alert('Generated domain is invalid');
+        try {
+          const item = await generateSingleDkimForDomain(serverId, domain);
+          const publicKeyField = document.getElementById('domainPublicKey');
+          const pemPathField = document.getElementById('domainPemPath');
+          const selectorField = document.getElementById('domainSelector');
+          if (publicKeyField) publicKeyField.value = item.publicKey || '';
+          if (pemPathField) pemPathField.value = item.remotePath || '';
+          if (selectorField) selectorField.value = item.selector || 'dkim';
+          alert(`DKIM generated successfully for ${domain}`);
+        } catch (error) {
+          alert(error.message || 'Failed to generate DKIM');
+        }
       }
 
       async function addRegistryDomain() {
@@ -2756,7 +3422,7 @@ http-access [IP1]/0 monitor
       function bindEvents() {
         document.getElementById('exportBtn')?.addEventListener('click', exportData);
         document.getElementById('importBtn')?.addEventListener('click', () => openJsonModal('import', ''));
-        document.getElementById('resetBtn')?.addEventListener('click', resetAll);
+        document.getElementById('bulkDkimBtn')?.addEventListener('click', openBulkDkimModal);
         document.getElementById('domainsRegistryBtn')?.addEventListener('click', () => {
           document.querySelectorAll('#mainTabs .tab').forEach(t => t.classList.remove('active'));
           document.getElementById('domainsRegistryTab')?.classList.add('active');
@@ -2800,6 +3466,8 @@ http-access [IP1]/0 monitor
           if (e.target.id === 'addServerBtn') await addServer();
           if (e.target.id === 'addIpBtn') await addIp();
           if (e.target.id === 'addDomainBtn') await addDomain();
+          if (e.target.id === 'serverCheckSshBtn') await checkServerSshFromWorkspace();
+          if (e.target.id === 'generateDomainDkimBtn') await regenerateCurrentDomainDkim();
 
           if (e.target.id === 'openServerWorkspaceBtn') {
             state.workspaceMode = 'auto';
@@ -2916,8 +3584,21 @@ http-access [IP1]/0 monitor
             closeJsonModal();
             return;
           }
+          if (e.target.id === 'bulkDkimCloseBtn' || e.target.id === 'bulkDkimCloseFooterBtn' || e.target.id === 'bulkDkimOverlay') {
+            closeBulkDkimModal();
+            return;
+          }
           if (e.target.id === 'copyJsonBtn') {
             copyJsonToClipboard();
+            return;
+          }
+          if (e.target.dataset.copyTarget) {
+            try {
+              await copyElementText(e.target.dataset.copyTarget);
+              setBulkDkimNotice('Copied to clipboard.', 'ok');
+            } catch (error) {
+              setBulkDkimNotice(error.message || 'Clipboard copy failed.', 'err');
+            }
             return;
           }
           if (e.target.id === 'downloadJsonBtn') {
@@ -2945,6 +3626,67 @@ http-access [IP1]/0 monitor
             setJsonModalNotice('Textarea cleared.', 'warn');
             return;
           }
+          if (e.target.id === 'bulkAddRowBtn') {
+            const server = getServerById(document.getElementById('bulkDkimServerId')?.value || '');
+            const rows = Array.from(document.querySelectorAll('#bulkDkimRows tr')).map(row => ({
+              domain: row.querySelector('[data-bulk-domain]')?.value.trim() || '',
+              selector: row.querySelector('[data-bulk-selector]')?.value.trim() || 'dkim',
+            }));
+            rows.push({ domain: '', selector: `s${rows.length + 1}` });
+            renderBulkDkimModal(server, rows);
+            return;
+          }
+          const removeRowBtn = e.target.closest('[data-bulk-remove-row]');
+          if (removeRowBtn) {
+            const server = getServerById(document.getElementById('bulkDkimServerId')?.value || '');
+            const indexToRemove = Number(removeRowBtn.dataset.bulkRemoveRow);
+            const rows = Array.from(document.querySelectorAll('#bulkDkimRows tr')).map(row => ({
+              domain: row.querySelector('[data-bulk-domain]')?.value.trim() || '',
+              selector: row.querySelector('[data-bulk-selector]')?.value.trim() || 'dkim',
+            })).filter((_, index) => index !== indexToRemove);
+            renderBulkDkimModal(server, rows.length ? rows : [{ domain: '', selector: 'dkim' }]);
+            return;
+          }
+          if (e.target.id === 'bulkCheckSshBtn') {
+            try {
+              const payload = validateSshSettings(collectBulkDkimPayload());
+              const result = await apiCheckSsh(payload);
+              setBulkDkimNotice(result.message || 'SSH connection succeeded.', 'ok');
+            } catch (error) {
+              setBulkDkimNotice(error.message || 'SSH connection failed.', 'err');
+            }
+            return;
+          }
+          if (e.target.id === 'bulkSaveToServerBtn') {
+            try {
+              const payload = validateSshSettings(collectBulkDkimPayload());
+              const serverId = payload.serverId || '';
+              writeSshSettingsToServer(serverId, payload);
+              await saveData();
+              setBulkDkimNotice('SSH settings saved into the selected server.', 'ok');
+              renderBulkDkimModal(getServerById(serverId), payload.domains.length ? payload.domains : [{ domain: '', selector: 'dkim' }]);
+            } catch (error) {
+              setBulkDkimNotice(error.message || 'Failed to save SSH settings.', 'err');
+            }
+            return;
+          }
+          if (e.target.id === 'bulkGenerateBtn') {
+            try {
+              const payload = validateSshSettings(collectBulkDkimPayload());
+              if (!payload.domains.length) throw new Error('Please add at least one domain');
+              const result = await apiGenerateDkim(payload);
+              state.bulkDkimResults = result;
+              if (payload.serverId) {
+                writeSshSettingsToServer(payload.serverId, payload);
+                await saveData();
+              }
+              renderBulkDkimModal(getServerById(payload.serverId), payload.domains);
+              setBulkDkimNotice(`Generated ${result.items?.length || 0} DKIM record(s) successfully.`, 'ok');
+            } catch (error) {
+              setBulkDkimNotice(error.message || 'Bulk DKIM generation failed.', 'err');
+            }
+            return;
+          }
           if (e.target.id === 'jsonModalOverlay') {
             closeJsonModal();
           }
@@ -2953,6 +3695,9 @@ http-access [IP1]/0 monitor
         document.addEventListener('keydown', (e) => {
           if (e.key === 'Escape' && document.getElementById('jsonModalOverlay')?.classList.contains('show')) {
             closeJsonModal();
+          }
+          if (e.key === 'Escape' && document.getElementById('bulkDkimOverlay')?.classList.contains('show')) {
+            closeBulkDkimModal();
           }
         });
       }
@@ -3070,6 +3815,48 @@ def api_post_data():
 def api_delete_data():
     set_data(default_data())
     return jsonify({"ok": True})
+
+
+@app.route('/api/dkim/check-ssh', methods=['POST'])
+def api_check_ssh():
+    payload = request.get_json(silent=True) or {}
+    ssh_host = (payload.get('sshHost') or '').strip()
+    ssh_user = (payload.get('sshUser') or '').strip()
+    ssh_pass = payload.get('sshPass') or ''
+    ssh_port = clean_int(payload.get('sshPort', 22), 22)
+    ssh_timeout = clean_int(payload.get('sshTimeout', 20), 20)
+
+    if not ssh_host or not ssh_user:
+        return jsonify({'ok': False, 'error': 'Missing SSH host or username.'}), 400
+
+    client = None
+    sftp = None
+    try:
+        client, sftp = ssh_connect_sftp(ssh_host, ssh_port, ssh_user, ssh_pass, timeout=ssh_timeout)
+        sftp.listdir('.')
+        return jsonify({'ok': True, 'message': f'✅ Connected to {ssh_host}:{ssh_port} (SFTP)'})
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'❌ Connection failed: {exc}'}), 400
+    finally:
+        try:
+            if sftp:
+                sftp.close()
+        except Exception:
+            pass
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+
+
+@app.route('/api/dkim/generate', methods=['POST'])
+def api_generate_dkim():
+    payload = request.get_json(silent=True) or {}
+    try:
+        return jsonify(run_dkim_generation(payload))
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
 
 
 if __name__ == '__main__':
