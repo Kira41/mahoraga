@@ -3315,6 +3315,270 @@ http-access [IP1]/0 monitor
 # ISP / BACKOFF RULES
 ############################################################################
 
+domain-macro hotmail hotmail.com,msn.com,hotmail.co.uk,hotmail.fr,live.com,hotmail.it,hotmail.de,email.msn.com,email.hotmail.com,email.msn.com,hotmail.com,live.com,msn.com,webtv.com,webtv.net
+<domain $hotmail>
+    max-smtp-out 1
+    max-msg-rate 250/h
+</domain>
+
+domain-macro yahoo yahoo.com,yahoo.ca,rocketmail.com,ymail.com,yahoo.com.au,geocities.com,yahoo.com.mx,yahoo.com.br,altavista.com,ameritech.net,att.net,bellsouth.net,attbroadband.com,attcanada.net,attglobal.com,attglobal.net,attnet.com,attworldnet.com,bellatlantic.net,bellatlantic.net,bellsouth.com,bellsouth.net,flash.net,netzero.net,nvbell.net,pacbell.net,prodigy.com,prodigy.net,sbcglobal.net,sbcglobal.net,snet.net,swbell.com,swbell.net,toast.net,usa.net,verizon.com,verizon.net,verizonmail.com,vzwpix.com,wans.net,worldnet.att.net,yahoo.net
+<domain $yahoo>
+    max-msg-per-connection 2
+    max-msg-rate 250/h
+</domain>
+
+domain-macro aol aol.com,aim.com,aim.net,cs.com,netscape.com,wmconnect.net,netscape.net,cs.com,mail.com,wmconnect.com,icqmail.com,email.com,usa.com
+<domain $aol>
+    max-msg-rate 250/h
+</domain>
+
+domain-macro gmail gmail.com,googlemail.com
+<domain $gmail>
+    max-msg-rate 250/h
+</domain>
+
+<domain comcast.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain tdameritrade.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain ameritrade.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain charterinternet.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain comcast.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain comcastwork.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain cox.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain cox.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain coxinternet.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain cox-internet.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain suddenlink.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain windjammer.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain centurylink.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain centurylink.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain centurytel.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain centurytel.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain cswnet.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain emadisonriver.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain emadisonriver.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain embarq.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain embarq.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain embarqmail.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain grics.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain gulftel.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain mebtel.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain qwest.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain uswest.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain uswest.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain swestmail.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain uswestmail.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain fuse.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain fuse.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain zoomnet.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain zoomtown.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain zoomtown.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain earthlink.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain earthlink.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain mindspring.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain netcom.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain Inbox.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain outblaze.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain excite.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain iwon.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain angelfire.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain lycos.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain lycosmail.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain mailcity.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain sprintpcs.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain rr.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain adelphia.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain adelphia.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain insightbb.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain roadrunner.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain roadrunner.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain tmomail.net>
+    max-msg-rate 250/h
+</domain>
+
+domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
+<domain $gmx>
+    max-msg-rate 250/h
+</domain>
+
+<domain juno.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain netzero.com>
+    max-msg-rate 250/h
+</domain>
+
+<domain unitedonline.net>
+    max-msg-rate 250/h
+</domain>
+
+<domain concentric.net>
+    max-msg-rate 250/h
+</domain>
+
+# default domain settings
 <domain *>
     max-smtp-out 2
     max-msg-per-connection 100
@@ -3344,15 +3608,172 @@ http-access [IP1]/0 monitor
     require-starttls no
 </domain>
 
+<smtp-pattern-list common-errors>
+    reply /generating high volumes of.* complaints from AOL/    mode=backoff
+    reply /Excessive unknown recipients - possible Open Relay/  mode=backoff
+    reply /^421 .* too many errors/                             mode=backoff
+    reply /blocked.*spamhaus/                                   mode=backoff
+    reply /451 Rejected/                                        mode=backoff
+</smtp-pattern-list>
+
 <smtp-pattern-list blocking-errors>
+    # AOL
+    reply /421 .* SERVICE NOT AVAILABLE/ mode=backoff
+    reply /generating high volumes of.* complaints from AOL/ mode=backoff
+    reply /554 .*aol.com/ mode=backoff
+    reply /421dynt1/ mode=backoff
+    reply /HVU:B1/ mode=backoff
+    reply /DNS:NR/ mode=backoff
+    reply /RLY:NW/ mode=backoff
+    reply /DYN:T1/ mode=backoff
+    reply /RLY:BD/ mode=backoff
+    reply /RLY:CH2/ mode=backoff
+    reply /RLY:CH2/ mode=backoff
+
+    # Yahoo
+    reply /421 .* Please try again later/ mode=backoff
+    reply /421 Message temporarily deferred/ mode=backoff
+    reply /VS3-IP5 Excessive unknown recipients/ mode=backoff
+    reply /VSS-IP Excessive unknown recipients/ mode=backoff
+    reply /[GL01] Message from/ mode=backoff
+    reply /[TS01] Messages from/ mode=backoff
+    reply /[TS02] Messages from/ mode=backoff
+    reply /[TS03] All messages from/ mode=backoff
+
+    # Hotmail
+    reply /exceeded the rate limit/ mode=backoff
+    reply /exceeded the connection limit/ mode=backoff
+    reply /Mail rejected by Windows Live Hotmail for policy reasons/ mode=backoff
+
+    # Adelphia
+    reply /421 Message Rejected/ mode=backoff
+    reply /Client host rejected/ mode=backoff
+    reply /blocked using UCEProtect/ mode=backoff
+
+    # Road Runner
+    reply /Mail Refused/ mode=backoff
+    reply /421 Exceeded allowable connection time/ mode=backoff
+    reply /amIBlockedByRR/ mode=backoff
+    reply /block-lookup/ mode=backoff
+    reply /Too many concurrent connections from source IP/ mode=backoff
+
+    # General
     reply /too many/ mode=backoff
+    reply /Exceeded allowable connection time/ mode=backoff
+    reply /Connection rate limit exceeded/ mode=backoff
+    reply /refused your connection/ mode=backoff
     reply /try again later/ mode=backoff
+    reply /try later/ mode=backoff
+    reply /550 RBL/ mode=backoff
+    reply /TDC internal RBL/ mode=backoff
     reply /connection refused/ mode=backoff
+    reply /please see www.spamhaus.org/ mode=backoff
+    reply /Message Rejected/ mode=backoff
+    reply /refused by antispam/ mode=backoff
+    reply /Service not available/ mode=backoff
     reply /currently blocked/ mode=backoff
+    reply /locally blacklisted/ mode=backoff
+    reply /not currently accepting mail from your ip/ mode=backoff
     reply /421.*closing connection/ mode=backoff
+    reply /421.*Lost connection/ mode=backoff
+    reply /476 connections from your host are denied/ mode=backoff
+    reply /421 Connection cannot be established/ mode=backoff
+    reply /421 temporary envelope failure/ mode=backoff
+    reply /421 4\.4\.2 Timeout while waiting for command/ mode=backoff
     reply /450 Requested action aborted/ mode=backoff
     reply /550 Access denied/ mode=backoff
+    reply /421rlynw/ mode=backoff
+    reply /permanently deferred/ mode=backoff
+    reply /d+.d+.d+.d+ blocked/ mode=backoff
 </smtp-pattern-list>
+
+############################################################################
+# BOUNCE RULES
+############################################################################
+
+<bounce-category-patterns>
+    /spam/ spam-related
+    /junk mail/ spam-related
+    /blacklist/ spam-related
+    /blocked/ spam-related
+    /\bU\.?C\.?E\.?\b/ spam-related
+    /\bAdv(ertisements?)?\b/ spam-related
+    /unsolicited/ spam-related
+    /\b(open)?RBL\b/ spam-related
+    /realtime blackhole/ spam-related
+    /\bvirus\b/ virus-related
+    /message +content/ content-related
+    /content +rejected/ content-related
+    /quota/ quota-issues
+    /limit exceeded/ quota-issues
+    /mailbox +(is +)?full/ quota-issues
+    /sender ((verify|verification) failed|could not be verified|address rejected|domain must exist)/ invalid-sender
+    /unable to verify sender/ invalid-sender
+    /requires valid sender domain/ invalid-sender
+    /bad sender's system address/ invalid-sender
+    /No MX for envelope sender domain/ invalid-sender
+    /^[45].4.4/ routing-errors
+    /no mail hosts for domain/ invalid-sender
+    /REQUESTED ACTION NOT TAKEN: DNS FAILURE/ invalid-sender
+    /Domain of sender address/ invalid-sender
+    /return MX does not exist/ invalid-sender
+    /Invalid sender domain/ invalid-sender
+    /Verification failed/ invalid-sender
+    /\bstorage\b/ quota-issues
+    /(user|mailbox|recipient|rcpt|local part|address|account|mail drop|ad(d?)ressee)
+    (has|has been|is)? *(currently|temporarily+)?(disabled|expired|inactive|not activated)
+    / inactive-mailbox
+    /(conta|usu.rio) inativ(a|o)
+    / inactive-mailbox
+    /Too many (bad|invalid|unknown|illegal|unavailable) (user|mailbox|recipient|rcpt|local part|address|account|mail drop|ad(d?)ressee)/other
+    /(No such|bad|invalid|unknown|illegal|unavailable) (local +)?(user|mailbox|recipient|rcpt|local part|address|account|mail drop|ad(d?)ressee)
+    / bad-mailbox
+    /(user|mailbox|recipient|rcpt|local part|address|account|mail drop|ad(d?)ressee) +(S+@S+ +)?(not (a +)?valid|not known|not here|not
+    found|does not exist|bad|invalid|unknown|illegal|unavailable)/ bad-mailbox
+    /S+@S+ +(is +)?(not (a +)?valid|not known|not here|not found|does not exist|bad|invalid|unknown|illegal|unavailable)/ bad-mailbox
+    /no mailbox here by that name/ bad-mailbox
+    /my badrcptto list/ bad-mailbox
+    /not our customer/ bad-mailbox
+    /no longer (valid|available)/ bad-mailbox
+    /have a S+ account/ bad-mailbox
+    /\brelay(ing)?/ relaying-issues
+    /domain (retired|bad|invalid|unknown|illegal|unavailable)/ bad-domain
+    /domain no longer in use/ bad-domain
+    /domain (S+ +)?(is +)?obsolete/ bad-domain
+    /denied/ policy-related
+    /prohibit/ policy-related
+    /refused/ policy-related
+    /allowed/ policy-related
+    /banned/ policy-related
+    /policy/ policy-related
+    /suspicious activity/ policy-related
+    /bad sequence/ protocol-errors
+    /syntax error/ protocol-errors
+    /\broute\b/ routing-errors
+    /\bunroutable\b/ routing-errors
+    /\bunrouteable\b/ routing-errors
+
+    /Invalid 7bit DATA/ content-related
+    /^2.d+.d+;/ success
+    /^[45].1.[1346];/ bad-mailbox
+    /^[45].1.2/ bad-domain
+    /^[45].1.[78];/ invalid-sender
+    /^[45].2.0;/ bad-mailbox
+    /^[45].2.1;/ inactive-mailbox
+    /^[45].2.2;/ quota-issues
+    /^[45].3.3;/ content-related
+    /^[45].3.5;/ bad-configuration
+    /^[45].4.1;/ no-answer-from-host
+    /^[45].4.2;/ bad-connection
+    /^[45].4.[36];/ routing-errors
+    /^[45].4.7;/ message-expired
+    /^[45].5.3;/ policy-related
+    /^[45].5.d+;/ protocol-errors
+    /^[45].6.d+;/ content-related
+    /^[45].7.[012];/ policy-related
+    /^[45].7.7;/ content-related
+    // other
+</bounce-category-patterns>
 
 ############################################################################
 # END
