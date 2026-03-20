@@ -926,17 +926,66 @@ HTML = r'''<!DOCTYPE html>
         };
       }
 
+      function safeArray(value) {
+        return Array.isArray(value) ? value : [];
+      }
+
       function loadDataFromBackendObject(obj) {
         const parsed = obj || defaultData();
         return {
           ...defaultData(),
           ...parsed,
-          domainDraftsByIp: parsed.domainDraftsByIp || {},
+          servers: safeArray(parsed.servers),
+          ips: safeArray(parsed.ips),
+          domains: safeArray(parsed.domains),
+          domainRegistry: safeArray(parsed.domainRegistry),
+          snapshots: safeArray(parsed.snapshots),
+          domainDraftsByIp: parsed.domainDraftsByIp && typeof parsed.domainDraftsByIp === 'object' ? parsed.domainDraftsByIp : {},
         };
+      }
+
+      function persistDataToLocalCache(data) {
+        try {
+          window.localStorage.setItem(STORAGE_KEY, JSON.stringify(loadDataFromBackendObject(data)));
+        } catch (error) {
+          console.warn('Unable to write local cache:', error);
+        }
+      }
+
+      function loadDataFromLocalCache() {
+        try {
+          const raw = window.localStorage.getItem(STORAGE_KEY);
+          if (!raw) return null;
+          return loadDataFromBackendObject(JSON.parse(raw));
+        } catch (error) {
+          console.warn('Unable to read local cache:', error);
+          return null;
+        }
+      }
+
+      function clearDataFromLocalCache() {
+        try {
+          window.localStorage.removeItem(STORAGE_KEY);
+        } catch (error) {
+          console.warn('Unable to clear local cache:', error);
+        }
+      }
+
+      function hasMeaningfulData(data) {
+        const normalized = loadDataFromBackendObject(data);
+        return Boolean(
+          normalized.servers.length ||
+          normalized.ips.length ||
+          normalized.domains.length ||
+          normalized.domainRegistry.length ||
+          normalized.snapshots.length ||
+          Object.keys(normalized.domainDraftsByIp || {}).length
+        );
       }
 
       async function saveData() {
         await apiSaveData(state.data);
+        persistDataToLocalCache(state.data);
         renderAll();
       }
 
@@ -1312,10 +1361,6 @@ HTML = r'''<!DOCTYPE html>
         await navigator.clipboard.writeText(text);
       }
 
-      function safeArray(value) {
-        return Array.isArray(value) ? value : [];
-      }
-
       function normalizeImportedData(parsed) {
         return {
           ...defaultData(),
@@ -1436,6 +1481,7 @@ HTML = r'''<!DOCTYPE html>
           const imported = parseJsonTextarea();
           state.data = mergeImportedData(imported);
           await apiSaveData(state.data);
+          persistDataToLocalCache(state.data);
           setJsonModalNotice('Data merged successfully with the existing dataset.', 'ok');
           renderAll();
         } catch (error) {
@@ -1456,6 +1502,7 @@ HTML = r'''<!DOCTYPE html>
           state.selectedRegistryDomainId = null;
           state.registryPage = 1;
           await apiSaveData(state.data);
+          persistDataToLocalCache(state.data);
           setJsonModalNotice('Existing data was replaced successfully with the new JSON dataset.', 'ok');
           renderAll();
         } catch (error) {
@@ -3246,6 +3293,7 @@ http-access [IP1]/0 monitor
         const confirmText = prompt('Type DELETE to remove all database data');
         if (confirmText !== 'DELETE') return;
         await apiResetData();
+        clearDataFromLocalCache();
         state.data = defaultData();
         state.selected = { type: null, id: null };
         state.pmtaParsed = null;
@@ -3718,7 +3766,20 @@ http-access [IP1]/0 monitor
 
       bindEvents();
       runSelfTests();
-      state.data = loadDataFromBackendObject(await apiGetData());
+      const cachedData = loadDataFromLocalCache();
+      try {
+        const backendData = loadDataFromBackendObject(await apiGetData());
+        state.data = backendData;
+        if (hasMeaningfulData(backendData) || !cachedData) {
+          persistDataToLocalCache(backendData);
+        } else {
+          state.data = cachedData;
+          await apiSaveData(state.data);
+          persistDataToLocalCache(state.data);
+        }
+      } catch (error) {
+        state.data = cachedData || defaultData();
+      }
       renderAll();
     });
   </script>
