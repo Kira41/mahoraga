@@ -1579,6 +1579,52 @@ HTML = r'''<!DOCTYPE html>
         return { score: Math.round(okCount / checks.length * 100), checks };
       }
 
+      function getDomainMissingChecks(domain) {
+        return getDomainReadiness(domain).checks.filter(check => !check.ok);
+      }
+
+      function getDomainMissingBadge(domain) {
+        const missingChecks = getDomainMissingChecks(domain);
+        if (!missingChecks.length) return '';
+        return statusBadge(`Missing ${missingChecks.length}`, 'err');
+      }
+
+      function getDraftMissingChecks(draft) {
+        if (!draft) return [];
+        const checks = [
+          { label: 'Domain valid', ok: isValidDomain(draft.domain) },
+          { label: 'VMTA exists', ok: !!draft.vmta?.trim() },
+          { label: 'HELO exists', ok: !!draft.helo?.trim() },
+          { label: 'PTR exists', ok: !!draft.ptr?.trim() },
+          { label: 'SPF valid', ok: /^v=spf1\s+/i.test(draft.spf || '') },
+          { label: 'DMARC valid', ok: /^v=DMARC1\s*;/i.test(draft.dmarc || '') },
+          { label: 'DKIM selector', ok: !!draft.selector?.trim() },
+          { label: 'DKIM path valid', ok: isValidPemPath(draft.domain, draft.pemPath) },
+          { label: 'Public key present', ok: !!draft.publicKey?.trim() },
+        ];
+        return checks.filter(check => !check.ok);
+      }
+
+      function getIpMissingCount(ip, linkedDomains = null, draft = null) {
+        const domains = linkedDomains || state.data.domains.filter(domain => domain.ipId === ip.id);
+        const draftRecord = draft ?? state.data.domainDraftsByIp?.[ip.id] ?? null;
+        const domainMissingCount = domains.reduce((total, domain) => total + getDomainMissingChecks(domain).length, 0);
+        const draftMissingCount = domains.length ? 0 : getDraftMissingChecks(draftRecord).length;
+        return domainMissingCount + draftMissingCount;
+      }
+
+      function getServerMissingCount(server, ips = null, domains = null) {
+        const serverIps = ips || state.data.ips.filter(ip => ip.serverId === server.id);
+        const serverDomains = domains || state.data.domains.filter(domain => domain.serverId === server.id);
+        const domainMissingCount = serverDomains.reduce((total, domain) => total + getDomainMissingChecks(domain).length, 0);
+        const draftMissingCount = serverIps.reduce((total, ip) => {
+          const hasLinkedDomain = serverDomains.some(domain => domain.ipId === ip.id);
+          if (hasLinkedDomain) return total;
+          return total + getDraftMissingChecks(state.data.domainDraftsByIp?.[ip.id] || null).length;
+        }, 0);
+        return domainMissingCount + draftMissingCount;
+      }
+
       function statusBadge(text, cls = 'muted') {
         return `<span class="status ${cls}">${escapeHtml(text)}</span>`;
       }
@@ -1973,6 +2019,11 @@ HTML = r'''<!DOCTYPE html>
             <label>DKIM Public Key</label>
             <textarea id="domainPublicKey" placeholder="Generated DKIM public key will appear here">${escapeHtml(domain?.publicKey || '')}</textarea>
           </div>
+          <div id="domainMissingNotice" class="notice ${domain?.publicKey ? 'ok' : 'warn'}" style="margin-top:12px;">
+            ${domain?.publicKey
+              ? 'DKIM public key is present. This domain can be saved without a missing-status warning for DKIM.'
+              : 'Warning: DKIM Public Key is empty. If you do not click "Generate DKIM From PTR Domain", this domain will be saved as Missing in the server tree, IP node, and domain node.'}
+          </div>
           <div class="inline-actions" style="margin-top:12px;">
             <button id="generateDomainDkimBtn" type="button">Generate DKIM From PTR Domain</button>
           </div>
@@ -1996,6 +2047,7 @@ HTML = r'''<!DOCTYPE html>
           const serverActive = state.selected.type === 'server' && state.selected.id === server.id ? 'active' : '';
           const serverExpanded = !state.treeCollapsed && !!state.expandedServers[server.id];
           const expiryStatus = getServerExpiryStatus(server.expiryDate || '');
+          const serverMissingCount = getServerMissingCount(server, ips, domains);
           return `
             <div class="tree-node ${serverActive}">
               <div class="tree-node-header" data-select-type="server" data-select-id="${server.id}">
@@ -2006,6 +2058,7 @@ HTML = r'''<!DOCTYPE html>
                 <div>
                   <span class="status muted" data-server-toggle="ips" data-server-id="${server.id}">${ips.length} IPs</span>
                   <span class="status muted" data-server-toggle="domains" data-server-id="${server.id}" style="margin-left:6px;">${domains.length} Domains</span>
+                  ${serverMissingCount ? statusBadge(`Missing ${serverMissingCount}`, 'err') : ''}
                   ${statusBadge(expiryStatus.label, expiryStatus.cls)}
                   <span class="status delete" data-delete-type="server" data-delete-id="${server.id}" style="margin-left:6px;">Delete</span>
                 </div>
@@ -2016,6 +2069,7 @@ HTML = r'''<!DOCTYPE html>
                   const draft = state.data.domainDraftsByIp?.[ip.id];
                   const ipActive = state.selected.type === 'ip' && state.selected.id === ip.id ? 'active' : '';
                   const ipExpanded = !!state.expandedIps[ip.id];
+                  const ipMissingCount = getIpMissingCount(ip, ipDomains, draft);
                   return `
                     <div class="tree-leaf ${ipActive}" data-select-type="ip" data-select-id="${ip.id}">
                       <div class="tree-leaf-head">
@@ -2023,6 +2077,7 @@ HTML = r'''<!DOCTYPE html>
                         <div>
                           ${statusBadge(ip.label || 'No label', 'muted')}
                           <span class="status muted" data-ip-toggle="domains" data-ip-id="${ip.id}" style="margin-left:6px;">${ipDomains.length || (draft ? 1 : 0)} Domains</span>
+                          ${ipMissingCount ? statusBadge(`Missing ${ipMissingCount}`, 'err') : ''}
                           <span class="status delete" data-delete-type="ip" data-delete-id="${ip.id}" style="margin-left:6px;">Delete</span>
                         </div>
                       </div>
@@ -2031,12 +2086,13 @@ HTML = r'''<!DOCTYPE html>
                         ${ipDomains.length ? ipDomains.map(domain => {
                           const readiness = getDomainReadiness(domain);
                           const active = state.selected.type === 'domain' && state.selected.id === domain.id ? 'active' : '';
+                          const domainMissingBadge = getDomainMissingBadge(domain);
                           return `
                             <div class="tree-leaf ${active}" data-select-type="domain" data-select-id="${domain.id}">
                               <div class="tree-leaf-head">
                                 <div class="tree-leaf-title ltr">${escapeHtml(domain.domain)}</div>
                                 <div>
-                                  ${statusBadgeByScore(readiness.score)}
+                                  ${domainMissingBadge || statusBadgeByScore(readiness.score)}
                                   <span class="status delete" data-delete-type="domain" data-delete-id="${domain.id}" style="margin-left:6px;">Delete</span>
                                 </div>
                               </div>
@@ -2047,7 +2103,7 @@ HTML = r'''<!DOCTYPE html>
                           <div class="tree-leaf" data-open-domain-draft="${ip.id}">
                             <div class="tree-leaf-head">
                               <div class="tree-leaf-title ltr">${escapeHtml(draft.domain)}</div>
-                              <div>${statusBadge('Draft', 'warn')}</div>
+                              <div>${getDraftMissingChecks(draft).length ? statusBadge(`Missing ${getDraftMissingChecks(draft).length}`, 'err') : statusBadge('Draft', 'warn')}</div>
                             </div>
                             <div class="tree-leaf-meta">Ready for domain completion. Review the generated DKIM public key in the workspace, then save.</div>
                           </div>
@@ -2121,6 +2177,7 @@ HTML = r'''<!DOCTYPE html>
           content.innerHTML = buildDomainForm(selectedDomain, contextIp.id, contextServer);
           hydrateDomainAutoFields();
           if (!selectedDomain) autoFillDomainFieldsFromSelectedIp();
+          updateDomainMissingNotice();
           return;
         }
 
@@ -2159,6 +2216,7 @@ HTML = r'''<!DOCTYPE html>
           badge.textContent = 'Domain selected';
           content.innerHTML = buildDomainForm(domain, domain?.ipId || '', contextServer);
           hydrateDomainAutoFields();
+          updateDomainMissingNotice();
           return;
         }
       }
@@ -2569,11 +2627,13 @@ HTML = r'''<!DOCTYPE html>
         const ip = state.data.ips.find(x => x.id === ipId);
         if (!ip) {
           clearDomainAutoFields();
+          updateDomainMissingNotice();
           return;
         }
         const draft = state.data.domainDraftsByIp?.[ipId] || buildDomainDraftFromIp(ip.serverId, ip);
         if (!draft) {
           clearDomainAutoFields();
+          updateDomainMissingNotice();
           return;
         }
         const fields = {
@@ -2591,6 +2651,26 @@ HTML = r'''<!DOCTYPE html>
           const el = document.getElementById(id);
           if (el) el.value = value;
         });
+        updateDomainMissingNotice();
+      }
+
+      function updateDomainMissingNotice() {
+        const notice = document.getElementById('domainMissingNotice');
+        const domain = normalizeDomain(document.getElementById('domainName')?.value || '');
+        const publicKey = document.getElementById('domainPublicKey')?.value.trim() || '';
+        if (!notice) return;
+        if (!domain) {
+          notice.className = 'notice warn';
+          notice.textContent = 'Select an IP with a valid PTR first to prepare the domain data and DKIM generation flow.';
+          return;
+        }
+        if (!publicKey) {
+          notice.className = 'notice warn';
+          notice.textContent = 'Warning: DKIM Public Key is empty. If you save now without clicking "Generate DKIM From PTR Domain", this domain will be marked as Missing in the server tree, IP node, and domain node.';
+          return;
+        }
+        notice.className = 'notice ok';
+        notice.textContent = 'DKIM public key is present. The domain no longer has a DKIM missing warning.';
       }
 
       async function checkServerSshFromWorkspace() {
@@ -2769,7 +2849,9 @@ HTML = r'''<!DOCTYPE html>
         if (!ipId) return alert('Please select an IP from the selected server');
         if (!isValidDomain(domain)) return alert('Generated domain is invalid');
         if (!vmta) return alert('Generated Virtual MTA name is missing');
-        if (!publicKey) return alert('Please generate or paste the DKIM public key');
+        if (!publicKey) {
+          alert(`DKIM Public Key is empty for ${domain}. You may have forgotten to click "Generate DKIM From PTR Domain". The domain will still be saved, but it will be marked as Missing under the server, IP, and domain tree nodes until you generate or paste the key.`);
+        }
 
         const editingDomain = state.selected.type === 'domain'
           ? state.data.domains.find(x => x.id === state.selected.id) || null
@@ -2820,6 +2902,7 @@ HTML = r'''<!DOCTYPE html>
           if (publicKeyField) publicKeyField.value = item.publicKey || '';
           if (pemPathField) pemPathField.value = item.remotePath || '';
           if (selectorField) selectorField.value = item.selector || 'dkim';
+          updateDomainMissingNotice();
           alert(`DKIM generated successfully for ${domain}`);
         } catch (error) {
           alert(error.message || 'Failed to generate DKIM');
@@ -3508,6 +3591,9 @@ http-access [IP1]/0 monitor
           if (e.target.id === 'ipPtr') {
             const helo = document.getElementById('ipHelo');
             if (helo) helo.value = normalizeDomain(e.target.value.trim());
+          }
+          if (e.target.id === 'domainPublicKey') {
+            updateDomainMissingNotice();
           }
         });
 
