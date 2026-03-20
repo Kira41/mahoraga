@@ -3,6 +3,7 @@ import posixpath
 import re
 import sqlite3
 import json
+from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 import urllib.parse
 import urllib.request
@@ -507,6 +508,225 @@ def poll_namecheap_dns(payload: dict):
         "message": f"Namecheap DNS records were updated for {domain}.",
     }
 
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def normalize_dns_text(value: str) -> str:
+    return ' '.join(str(value or '').replace('"', '').split()).strip().lower()
+
+
+def normalize_dns_target(value: str) -> str:
+    return str(value or '').strip().lower().rstrip('.')
+
+
+def resolve_dns_values(name: str, record_type: str) -> List[str]:
+    clean_name = normalize_dns_target(name)
+    if not clean_name:
+        return []
+
+    endpoint = 'https://dns.google/resolve?' + urllib.parse.urlencode({'name': clean_name, 'type': record_type})
+    request_obj = urllib.request.Request(endpoint, headers={'Accept': 'application/json'})
+    try:
+        with urllib.request.urlopen(request_obj, timeout=8) as response:
+            payload = json.loads(response.read().decode('utf-8', errors='replace'))
+    except Exception:
+        return []
+
+    answers = payload.get('Answer') or []
+    values: List[str] = []
+    for answer in answers:
+        data = str(answer.get('data') or '').strip()
+        if not data:
+            continue
+        if record_type == 'TXT':
+            values.append(data.replace('"', ''))
+        elif record_type == 'MX':
+            parts = data.split(None, 1)
+            if len(parts) == 2:
+                values.append(f"{parts[0]} {normalize_dns_target(parts[1])}")
+            else:
+                values.append(normalize_dns_target(data))
+        else:
+            values.append(normalize_dns_target(data))
+    return values
+
+
+def fqdn_from_record_name(host: str, domain: str) -> str:
+    clean_host = (host or '@').strip() or '@'
+    clean_domain = normalize_dns_target(domain)
+    if clean_host in ('@', ''):
+        return clean_domain
+    return f'{clean_host.rstrip(".")}.{clean_domain}'
+
+
+def format_snapshot_record(record: Dict[str, str], domain: str) -> Dict[str, str]:
+    host = (record.get('name') or '@').strip() or '@'
+    return {
+        'host': host,
+        'fqdn': fqdn_from_record_name(host, domain),
+        'type': (record.get('type') or '').upper(),
+        'value': record.get('address') or '',
+        'mxPref': str(record.get('mx_pref') or ''),
+        'ttl': str(record.get('ttl') or ''),
+    }
+
+
+def find_matching_namecheap_record(records: List[Dict[str, str]], expected: Dict[str, str]) -> Optional[Dict[str, str]]:
+    expected_type = (expected.get('type') or '').upper()
+    expected_name = (expected.get('name') or '').strip().lower()
+    expected_pref = str(expected.get('mx_pref') or '')
+    for record in records:
+        if (record.get('type') or '').upper() != expected_type:
+            continue
+        if (record.get('name') or '').strip().lower() != expected_name:
+            continue
+        if expected_type == 'MX' and expected_pref and str(record.get('mx_pref') or '') != expected_pref:
+            continue
+        return record
+    return None
+
+
+def build_dns_check(key: str, label: str, host: str, expected: str, namecheap_values: List[str], public_values: List[str]) -> Dict[str, object]:
+    normalized_expected = normalize_dns_text(expected)
+    normalized_namecheap = [normalize_dns_text(item) for item in namecheap_values]
+    normalized_public = [normalize_dns_text(item) for item in public_values]
+    issues: List[str] = []
+
+    if not namecheap_values:
+        issues.append(f'Namecheap is missing the expected {label} record for {host}.')
+    elif normalized_expected not in normalized_namecheap:
+        issues.append(f'Namecheap {label} value does not match the expected configuration.')
+
+    if not public_values:
+        issues.append(f'Public DNS did not return a {label} record for {host}.')
+    elif normalized_expected not in normalized_public:
+        issues.append(f'Public DNS {label} value does not match the expected configuration.')
+
+    return {
+        'key': key,
+        'label': label,
+        'host': host,
+        'expected': expected,
+        'namecheapValues': namecheap_values,
+        'publicValues': public_values,
+        'status': 'ok' if not issues else 'error',
+        'issues': issues,
+    }
+
+
+def build_domain_verification(payload: dict) -> Dict[str, object]:
+    client = build_namecheap_client(payload.get('config') or {})
+    domain = str(payload.get('domain') or '').strip().lower()
+    if not domain:
+        raise ValueError('Domain is required.')
+
+    expected_records = build_required_namecheap_records(payload)
+    expected_map = {
+        f"{(record.get('name') or '@').strip() or '@'}|{(record.get('type') or '').upper()}|{record.get('mx_pref') or ''}": record
+        for record in expected_records
+    }
+    namecheap_records = client.list_dns_records(domain)
+    snapshot_records = [format_snapshot_record(record, domain) for record in namecheap_records]
+
+    def required_record(name: str, record_type: str, mx_pref: str = '') -> Dict[str, str]:
+        key = f'{name}|{record_type}|{mx_pref}'
+        return expected_map[key]
+
+    a_record = required_record('@', 'A')
+    mx_record = required_record('@', 'MX', '10')
+    spf_record = required_record('@', 'TXT')
+    selector = str(payload.get('selector') or 'dkim').strip() or 'dkim'
+    dkim_name = f'{selector}._domainkey'
+    dkim_record = required_record(dkim_name, 'TXT')
+    dmarc_record = required_record('_dmarc', 'TXT')
+
+    checks = [
+        build_dns_check(
+            'root-a',
+            'Root A',
+            domain,
+            a_record.get('address') or '',
+            [match.get('address') or '' for match in [find_matching_namecheap_record(namecheap_records, a_record)] if match],
+            resolve_dns_values(domain, 'A'),
+        ),
+        build_dns_check(
+            'mx',
+            'MX',
+            domain,
+            f"{mx_record.get('mx_pref') or '10'} {normalize_dns_target(mx_record.get('address') or '')}",
+            [f"{match.get('mx_pref') or ''} {normalize_dns_target(match.get('address') or '')}".strip() for match in [find_matching_namecheap_record(namecheap_records, mx_record)] if match],
+            resolve_dns_values(domain, 'MX'),
+        ),
+        build_dns_check(
+            'spf',
+            'SPF',
+            domain,
+            spf_record.get('address') or '',
+            [record.get('address') or '' for record in namecheap_records if (record.get('type') or '').upper() == 'TXT' and (record.get('name') or '@').strip().lower() in ('', '@') and normalize_dns_text(record.get('address') or '').startswith('v=spf1')],
+            resolve_dns_values(domain, 'TXT'),
+        ),
+        build_dns_check(
+            'dkim',
+            'DKIM',
+            fqdn_from_record_name(dkim_name, domain),
+            dkim_record.get('address') or '',
+            [record.get('address') or '' for record in namecheap_records if (record.get('type') or '').upper() == 'TXT' and (record.get('name') or '').strip().lower() == dkim_name.lower()],
+            resolve_dns_values(fqdn_from_record_name(dkim_name, domain), 'TXT'),
+        ),
+        build_dns_check(
+            'dmarc',
+            'DMARC',
+            fqdn_from_record_name('_dmarc', domain),
+            dmarc_record.get('address') or '',
+            [record.get('address') or '' for record in namecheap_records if (record.get('type') or '').upper() == 'TXT' and (record.get('name') or '').strip().lower() == '_dmarc'],
+            resolve_dns_values(fqdn_from_record_name('_dmarc', domain), 'TXT'),
+        ),
+    ]
+
+    helo_target = normalize_dns_target(str(payload.get('helo') or f'mail.{domain}'))
+    helo_host = extract_relative_host(helo_target, domain)
+    if helo_host:
+        helo_expected = {'name': helo_host, 'type': 'A', 'address': a_record.get('address') or '', 'mx_pref': ''}
+        checks.append(
+            build_dns_check(
+                'helo-a',
+                'HELO A',
+                fqdn_from_record_name(helo_host, domain),
+                a_record.get('address') or '',
+                [match.get('address') or '' for match in [find_matching_namecheap_record(namecheap_records, helo_expected)] if match],
+                resolve_dns_values(fqdn_from_record_name(helo_host, domain), 'A'),
+            )
+        )
+
+    issue_count = sum(len(check['issues']) for check in checks)
+    auth_ok = all(check['status'] == 'ok' for check in checks if check['key'] in {'spf', 'dkim', 'dmarc'})
+    overall_ok = issue_count == 0
+    alerts = [
+        {
+            'level': 'error',
+            'label': check['label'],
+            'host': check['host'],
+            'messages': check['issues'],
+            'expected': check['expected'],
+        }
+        for check in checks if check['issues']
+    ]
+
+    return {
+        'ok': True,
+        'domain': domain,
+        'checkedAt': utc_now_iso(),
+        'healthStatus': 'ok' if auth_ok else 'error',
+        'overallStatus': 'ok' if overall_ok else 'error',
+        'issueCount': issue_count,
+        'checks': checks,
+        'alerts': alerts,
+        'snapshot': {'records': snapshot_records, 'count': len(snapshot_records)},
+        'message': 'DNS verification completed successfully.' if overall_ok else f'DNS verification completed with {issue_count} issue(s).',
+    }
+
 HTML = r'''<!DOCTYPE html>
 <html lang="en" dir="ltr">
 <head>
@@ -651,6 +871,33 @@ HTML = r'''<!DOCTYPE html>
     .notice.ok { border-color: rgba(39,194,129,.35); color: #7ff0bb; }
     .notice.warn { border-color: rgba(244,183,64,.35); color: #ffd97d; }
     .notice.err { border-color: rgba(255,107,107,.35); color: #ffb1b1; }
+
+    .alert-stack { display: grid; gap: 10px; margin-top: 12px; }
+    .dns-alert {
+      border: 1px solid rgba(255,107,107,.35);
+      border-radius: 14px;
+      background: rgba(255,107,107,.08);
+      padding: 12px 14px;
+    }
+    .dns-alert.ok {
+      border-color: rgba(39,194,129,.35);
+      background: rgba(39,194,129,.08);
+    }
+    .dns-alert-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+    .dns-alert-title { font-weight: 700; }
+    .dns-alert-list { margin: 8px 0 0; padding-left: 18px; color: var(--text); }
+    .dns-alert-list li + li { margin-top: 4px; }
+    .snapshot-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    .snapshot-table th, .snapshot-table td { padding: 10px 8px; border-bottom: 1px solid rgba(255,255,255,.06); text-align: left; vertical-align: top; }
+    .snapshot-table th { color: var(--muted); font-size: 12px; }
+    .health-strip { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    .mono-wrap { word-break: break-word; overflow-wrap: anywhere; }
 
     .qm-layout { display: grid; grid-template-columns: 1fr; gap: 14px; align-items: start; }
     .qm-layout.with-workspace { grid-template-columns: 1fr 1fr; }
@@ -1064,7 +1311,7 @@ HTML = r'''<!DOCTYPE html>
 
       <div class="tab-panel" id="dnsPanel">
         <h2>DNS Summary</h2>
-        <div class="sub">This is an internal review helper and does not replace actual DNS verification from your provider.</div>
+        <div class="sub">Live verification now compares Namecheap DNS and public DNS against the expected SPF, DKIM, DMARC, MX, and HELO records.</div>
         <div id="dnsContent" class="notice">Select a domain to view SPF / DKIM / DMARC / PTR / HELO details.</div>
       </div>
 
@@ -1324,6 +1571,17 @@ HTML = r'''<!DOCTYPE html>
         return data;
       }
 
+      async function apiVerifyNamecheapDomain(payload) {
+        const response = await fetch('/api/namecheap/verify-domain', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Namecheap DNS verification failed');
+        return data;
+      }
+
       function uid(prefix = 'id') {
         return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
       }
@@ -1577,6 +1835,23 @@ HTML = r'''<!DOCTYPE html>
         return { ...defaultData().namecheapConfig, ...(state.data.namecheapConfig || {}) };
       }
 
+      function getDomainVerification(domain) {
+        return domain?.verification && typeof domain.verification === 'object' ? domain.verification : null;
+      }
+
+      function getDomainVerificationSummary(domain) {
+        const verification = getDomainVerification(domain);
+        if (!verification) {
+          return { status: 'muted', label: 'Not verified', issueCount: 0, checkedAt: '' };
+        }
+        return {
+          status: verification.overallStatus === 'ok' ? 'ok' : 'err',
+          label: verification.overallStatus === 'ok' ? 'Verified' : `Issues ${verification.issueCount || 0}`,
+          issueCount: Number(verification.issueCount || 0),
+          checkedAt: verification.checkedAt || '',
+        };
+      }
+
       function renderNamecheapDomains(domains = []) {
         const list = document.getElementById('namecheapDomainsList');
         if (!list) return;
@@ -1585,11 +1860,26 @@ HTML = r'''<!DOCTYPE html>
           list.textContent = 'No domains loaded yet.';
           return;
         }
+        const linkedDomains = new Set((state.data.domains || []).map(item => normalizeDomain(item.domain || '')));
         list.className = 'pre-box';
         list.innerHTML = domains.map(domain => {
-          const name = escapeHtml(domain.name || '');
+          const nameRaw = normalizeDomain(domain.name || '');
+          const name = escapeHtml(nameRaw || '');
           const expires = escapeHtml(domain.expires || '-');
-          return `<div style="padding:4px 0;"><strong>${name}</strong> <span class="muted">· expires ${expires}</span></div>`;
+          const linked = linkedDomains.has(nameRaw);
+          const expired = String(domain.isExpired || '').toLowerCase() === 'true';
+          return `
+            <div style="padding:8px 0; border-bottom:1px solid rgba(255,255,255,.06);">
+              <div style="display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap;">
+                <strong>${name}</strong>
+                <div class="domain-actions">
+                  ${expired ? statusBadge('Expired', 'err') : statusBadge('Active', 'ok')}
+                  ${linked ? statusBadge('Linked', 'ok') : statusBadge('Available', 'muted')}
+                </div>
+              </div>
+              <div class="muted" style="margin-top:4px;">expires ${expires}${domain.autoRenew === 'true' ? ' · auto renew on' : ''}</div>
+            </div>
+          `;
         }).join('');
       }
 
@@ -2102,6 +2392,7 @@ HTML = r'''<!DOCTYPE html>
         const checks = [];
         const server = state.data.servers.find(s => s.id === domain.serverId);
         const ip = state.data.ips.find(i => i.id === domain.ipId);
+        const verification = getDomainVerification(domain);
         checks.push({ label: 'Server assigned', ok: !!server });
         checks.push({ label: 'IP assigned', ok: !!ip && isValidIPv4(ip.ip) });
         checks.push({ label: 'Domain valid', ok: isValidDomain(domain.domain) });
@@ -2113,8 +2404,12 @@ HTML = r'''<!DOCTYPE html>
         checks.push({ label: 'DKIM selector', ok: !!domain.selector?.trim() });
         checks.push({ label: 'DKIM path valid', ok: isValidPemPath(domain.domain, domain.pemPath) });
         checks.push({ label: 'Public key present', ok: !!domain.publicKey?.trim() });
+        checks.push({ label: 'DNS health verified', ok: !!verification });
+        checks.push({ label: 'SPF live check', ok: !verification || verification.checks?.find(item => item.key === 'spf')?.status === 'ok' });
+        checks.push({ label: 'DKIM live check', ok: !verification || verification.checks?.find(item => item.key === 'dkim')?.status === 'ok' });
+        checks.push({ label: 'DMARC live check', ok: !verification || verification.checks?.find(item => item.key === 'dmarc')?.status === 'ok' });
         const okCount = checks.filter(c => c.ok).length;
-        return { score: Math.round(okCount / checks.length * 100), checks };
+        return { score: Math.round(okCount / checks.length * 100), checks, verification };
       }
 
       function getDomainMissingChecks(domain) {
@@ -2194,6 +2489,82 @@ HTML = r'''<!DOCTYPE html>
         if (score >= 90) return statusBadge(`Ready ${score}%`, 'ok');
         if (score >= 60) return statusBadge(`Partial ${score}%`, 'warn');
         return statusBadge(`Issues ${score}%`, 'err');
+      }
+
+      function formatVerificationTimestamp(value = '') {
+        if (!value) return '-';
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+      }
+
+      function buildVerificationAlertsMarkup(verification) {
+        if (!verification) return '<div class="muted-box">No live Namecheap verification has been run for this domain yet.</div>';
+        if (!verification.alerts?.length) {
+          return `
+            <div class="dns-alert ok">
+              <div class="dns-alert-head">
+                <div class="dns-alert-title">All monitored DNS records look healthy</div>
+                ${statusBadge('OK', 'ok')}
+              </div>
+              <div class="muted">Checked at ${escapeHtml(formatVerificationTimestamp(verification.checkedAt || ''))}.</div>
+            </div>
+          `;
+        }
+        return `<div class="alert-stack">${verification.alerts.map(alert => `
+          <div class="dns-alert">
+            <div class="dns-alert-head">
+              <div class="dns-alert-title">${escapeHtml(alert.label || 'DNS issue')} · <span class="ltr">${escapeHtml(alert.host || '-')}</span></div>
+              ${statusBadge('Error', 'err')}
+            </div>
+            <ul class="dns-alert-list">
+              ${(alert.messages || []).map(message => `<li>${escapeHtml(message)}</li>`).join('')}
+            </ul>
+            <div class="muted" style="margin-top:8px;">Expected: <span class="mono-wrap ltr">${escapeHtml(alert.expected || '-')}</span></div>
+          </div>
+        `).join('')}</div>`;
+      }
+
+      function normalizeSnapshotRecords(snapshotRecords = [], domainName = '') {
+        return (snapshotRecords || []).map(record => {
+          const host = record.host || record.name || '@';
+          const fqdn = record.fqdn || (host === '@' ? domainName : `${host}.${domainName}`);
+          return {
+            host,
+            fqdn,
+            type: record.type || '-',
+            value: record.value || record.address || '-',
+            mxPref: record.mxPref || record.mx_pref || '',
+            ttl: record.ttl || '-',
+          };
+        });
+      }
+
+      function buildSnapshotTable(snapshotRecords = []) {
+        if (!snapshotRecords.length) return '<div class="muted-box">No DNS snapshot has been captured yet for this domain.</div>';
+        return `
+          <table class="snapshot-table">
+            <thead>
+              <tr>
+                <th>Host</th>
+                <th>FQDN</th>
+                <th>Type</th>
+                <th>Value</th>
+                <th>TTL</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${snapshotRecords.map(record => `
+                <tr>
+                  <td class="ltr">${escapeHtml(record.host || '-')}</td>
+                  <td class="ltr mono-wrap">${escapeHtml(record.fqdn || '-')}</td>
+                  <td>${escapeHtml(record.type || '-')}</td>
+                  <td class="ltr mono-wrap">${escapeHtml(record.mxPref ? `${record.mxPref} ${record.value || ''}`.trim() : (record.value || '-'))}</td>
+                  <td>${escapeHtml(record.ttl || '-')}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        `;
       }
 
       function findLinkedServerNameForDomain(domainName) {
@@ -2587,6 +2958,7 @@ HTML = r'''<!DOCTYPE html>
           </div>
           <div class="inline-actions" style="margin-top:12px;">
             <button id="generateDomainDkimBtn" type="button">Generate DKIM From PTR Domain</button>
+            <button id="verifyDomainHealthBtn" type="button">Verify DNS Health</button>
             <button id="pollNamecheapBtn" type="button" class="btn-warning">Polling NameChip</button>
           </div>
           <div style="margin-top:12px;">
@@ -2862,6 +3234,9 @@ HTML = r'''<!DOCTYPE html>
           const server = state.data.servers.find(x => x.id === domain.serverId);
           const ip = state.data.ips.find(x => x.id === domain.ipId);
           const readiness = getDomainReadiness(domain);
+          const verification = getDomainVerification(domain);
+          const verificationSummary = getDomainVerificationSummary(domain);
+          const snapshotRecords = normalizeSnapshotRecords(verification?.snapshot?.records || domain.namecheapSnapshot?.records || domain.namecheapLastAppliedRecords || [], domain.domain);
           hero.innerHTML = `
             <h4>Selection Summary</h4>
             <div class="kv">
@@ -2870,18 +3245,31 @@ HTML = r'''<!DOCTYPE html>
               <div class="kv-row"><span>IP</span><strong class="ltr">${escapeHtml(ip?.ip || '-')}</strong></div>
               <div class="kv-row"><span>VMTA</span><strong class="ltr">${escapeHtml(domain.vmta || '-')}</strong></div>
               <div class="kv-row"><span>HELO</span><strong class="ltr">${escapeHtml(domain.helo || '-')}</strong></div>
+              <div class="kv-row"><span>Last verification</span><strong>${escapeHtml(formatVerificationTimestamp(verification?.checkedAt || domain.namecheapLastCheckedAt || ''))}</strong></div>
             </div>`;
           hierarchy.innerHTML = `<h4>Hierarchy</h4><div class="muted-box">Server <strong>${escapeHtml(server?.name || '-')}</strong> → IP <strong class="ltr">${escapeHtml(ip?.ip || '-')}</strong> → Domain <strong class="ltr">${escapeHtml(domain.domain)}</strong></div>`;
-          domainsBox.innerHTML = `<h4>Linked Domains</h4><div class="domain-list-compact"><div class="domain-row"><div class="domain-row-top"><strong class="ltr">${escapeHtml(domain.domain)}</strong>${statusBadgeByScore(readiness.score)}</div><div class="tree-leaf-meta ltr">PTR ${escapeHtml(domain.ptr || '-')} · Selector ${escapeHtml(domain.selector || '-')}</div></div></div>`;
-          health.innerHTML = `<h4>Health & Readiness</h4><div class="checklist">${readiness.checks.map(c => `<div class="check"><span>${escapeHtml(c.label)}</span><span>${c.ok ? statusBadge('OK', 'ok') : statusBadge('Fix', 'err')}</span></div>`).join('')}</div>`;
+          domainsBox.innerHTML = `<h4>Linked Domains</h4><div class="domain-list-compact"><div class="domain-row"><div class="domain-row-top"><strong class="ltr">${escapeHtml(domain.domain)}</strong><div class="domain-actions">${statusBadgeByScore(readiness.score)}${statusBadge(verificationSummary.label, verificationSummary.status)}</div></div><div class="tree-leaf-meta ltr">PTR ${escapeHtml(domain.ptr || '-')} · Selector ${escapeHtml(domain.selector || '-')}</div></div></div>`;
+          health.innerHTML = `
+            <h4>Health & Readiness</h4>
+            <div class="health-strip">
+              ${statusBadge(verification?.healthStatus === 'ok' ? 'Health: OK' : verification ? 'Health: Error' : 'Health: Not Verified', verification?.healthStatus === 'ok' ? 'ok' : verification ? 'err' : 'muted')}
+              ${statusBadge(verificationSummary.label, verificationSummary.status)}
+              ${statusBadge(`Checks ${readiness.score}%`, readiness.score >= 90 ? 'ok' : readiness.score >= 60 ? 'warn' : 'err')}
+            </div>
+            <div class="checklist">${readiness.checks.map(c => `<div class="check"><span>${escapeHtml(c.label)}</span><span>${c.ok ? statusBadge('OK', 'ok') : statusBadge('Fix', 'err')}</span></div>`).join('')}</div>
+            ${buildVerificationAlertsMarkup(verification)}
+          `;
           config.innerHTML = `
             <h4>Config Snapshot</h4>
             <div class="kv">
-              <div class="kv-row"><span>SPF</span><strong class="ltr">${escapeHtml(domain.spf || '-')}</strong></div>
-              <div class="kv-row"><span>DMARC</span><strong class="ltr">${escapeHtml(domain.dmarc || '-')}</strong></div>
-              <div class="kv-row"><span>DKIM Path</span><strong class="ltr">${escapeHtml(domain.pemPath || '-')}</strong></div>
+              <div class="kv-row"><span>SPF</span><strong class="ltr mono-wrap">${escapeHtml(domain.spf || '-')}</strong></div>
+              <div class="kv-row"><span>DMARC</span><strong class="ltr mono-wrap">${escapeHtml(domain.dmarc || '-')}</strong></div>
+              <div class="kv-row"><span>DKIM Path</span><strong class="ltr mono-wrap">${escapeHtml(domain.pemPath || '-')}</strong></div>
               <div class="kv-row"><span>Public Key</span><strong>${domain.publicKey ? 'Present' : 'Missing'}</strong></div>
-            </div>`;
+              <div class="kv-row"><span>Namecheap records</span><strong>${snapshotRecords.length}</strong></div>
+            </div>
+            ${buildSnapshotTable(snapshotRecords)}
+          `;
         }
       }
 
@@ -2895,17 +3283,34 @@ HTML = r'''<!DOCTYPE html>
         }
         const ip = state.data.ips.find(i => i.id === domain.ipId);
         const dkimHost = `${domain.selector}._domainkey.${domain.domain}`;
+        const verification = getDomainVerification(domain);
+        const checkCards = verification?.checks?.length
+          ? `<div class="alert-stack">${verification.checks.map(check => `
+              <div class="dns-alert ${check.status === 'ok' ? 'ok' : ''}">
+                <div class="dns-alert-head">
+                  <div class="dns-alert-title">${escapeHtml(check.label)} · <span class="ltr">${escapeHtml(check.host || '-')}</span></div>
+                  ${statusBadge(check.status === 'ok' ? 'OK' : 'Error', check.status === 'ok' ? 'ok' : 'err')}
+                </div>
+                <div class="muted">Expected: <span class="ltr mono-wrap">${escapeHtml(check.expected || '-')}</span></div>
+                <div class="muted" style="margin-top:6px;">Namecheap: <span class="ltr mono-wrap">${escapeHtml((check.namecheapValues || []).join(' | ') || '-')}</span></div>
+                <div class="muted" style="margin-top:6px;">Public DNS: <span class="ltr mono-wrap">${escapeHtml((check.publicValues || []).join(' | ') || '-')}</span></div>
+                ${check.issues?.length ? `<ul class="dns-alert-list">${check.issues.map(issue => `<li>${escapeHtml(issue)}</li>`).join('')}</ul>` : ''}
+              </div>
+            `).join('')}</div>`
+          : '<div class="muted-box">Run Verify DNS Health to compare Namecheap and public DNS.</div>';
         box.className = 'notice';
         box.innerHTML = `
           <div><strong>Domain:</strong> <span class="ltr">${escapeHtml(domain.domain)}</span></div>
           <div><strong>IP:</strong> <span class="ltr">${escapeHtml(ip?.ip || '-')}</span></div>
           <div><strong>HELO / A:</strong> <span class="ltr">${escapeHtml(domain.helo || '-')}</span></div>
           <div><strong>PTR:</strong> <span class="ltr">${escapeHtml(domain.ptr || '-')}</span></div>
-          <div><strong>SPF TXT:</strong> <div class="ltr">${escapeHtml(domain.spf || '-')}</div></div>
+          <div><strong>SPF TXT:</strong> <div class="ltr mono-wrap">${escapeHtml(domain.spf || '-')}</div></div>
           <div style="margin-top:8px"><strong>DKIM Host:</strong> <span class="ltr">${escapeHtml(dkimHost)}</span></div>
-          <div><strong>DKIM PEM Path:</strong> <span class="ltr">${escapeHtml(domain.pemPath || '-')}</span></div>
-          <div><strong>DKIM Public Key:</strong> <div class="ltr">${escapeHtml(domain.publicKey || '-')}</div></div>
-          <div style="margin-top:8px"><strong>DMARC TXT:</strong> <div class="ltr">${escapeHtml(domain.dmarc || '-')}</div></div>
+          <div><strong>DKIM PEM Path:</strong> <span class="ltr mono-wrap">${escapeHtml(domain.pemPath || '-')}</span></div>
+          <div><strong>DKIM Public Key:</strong> <div class="ltr mono-wrap">${escapeHtml(domain.publicKey || '-')}</div></div>
+          <div style="margin-top:8px"><strong>DMARC TXT:</strong> <div class="ltr mono-wrap">${escapeHtml(domain.dmarc || '-')}</div></div>
+          <div style="margin-top:12px;"><strong>Live Verification</strong></div>
+          ${checkCards}
         `;
       }
 
@@ -2918,10 +3323,16 @@ HTML = r'''<!DOCTYPE html>
           return;
         }
         const rd = getDomainReadiness(domain);
-        box.className = rd.score >= 90 ? 'notice ok' : rd.score >= 60 ? 'notice warn' : 'notice err';
+        const verification = getDomainVerification(domain);
+        const authChecks = verification?.checks?.filter(check => ['spf', 'dkim', 'dmarc'].includes(check.key)) || [];
+        const authOk = authChecks.length ? authChecks.every(check => check.status === 'ok') : false;
+        box.className = authOk ? 'notice ok' : verification ? 'notice err' : (rd.score >= 90 ? 'notice ok' : rd.score >= 60 ? 'notice warn' : 'notice err');
         box.innerHTML = `
           <div><strong>Domain:</strong> <span class="ltr">${escapeHtml(domain.domain)}</span></div>
-          <div style="margin-top:6px"><strong>Final Score:</strong> ${statusBadgeByScore(rd.score)}</div>
+          <div class="health-strip" style="margin-top:6px;">
+            <span><strong>Final Score:</strong> ${statusBadgeByScore(rd.score)}</span>
+            ${statusBadge(authOk ? 'Health: OK' : verification ? 'Health: Error' : 'Health: Not Verified', authOk ? 'ok' : verification ? 'err' : 'muted')}
+          </div>
           <div class="divider"></div>
           <div class="checklist">
             ${rd.checks.map(c => `
@@ -2931,6 +3342,7 @@ HTML = r'''<!DOCTYPE html>
               </div>
             `).join('')}
           </div>
+          ${buildVerificationAlertsMarkup(verification)}
         `;
       }
 
@@ -3542,6 +3954,76 @@ HTML = r'''<!DOCTYPE html>
           alert(`DKIM generated successfully for ${domain}`);
         } catch (error) {
           alert(error.message || 'Failed to generate DKIM');
+        }
+      }
+
+      async function verifyCurrentDomainHealth() {
+        const config = getNamecheapConfig();
+        if (!config.token || !config.username || !config.apiKey || !config.clientIp) {
+          alert('Please save Namecheap configuration first from the NameChip Config popup.');
+          openNamecheapModal();
+          return;
+        }
+
+        const domain = normalizeDomain(document.getElementById('domainName')?.value || '');
+        const helo = document.getElementById('domainHelo')?.value.trim() || '';
+        const selector = document.getElementById('domainSelector')?.value.trim() || 'dkim';
+        const spf = document.getElementById('domainSpf')?.value.trim() || '';
+        const dmarc = document.getElementById('domainDmarc')?.value.trim() || '';
+        const publicKey = document.getElementById('domainPublicKey')?.value.trim() || '';
+        const serverId = document.getElementById('domainServerSelect')?.value || '';
+        const ipId = document.getElementById('domainIpSelect')?.value || '';
+        const ipRecord = state.data.ips.find(ip => ip.id === ipId);
+        if (!ipRecord?.ip) return alert('This domain is missing a linked IP address.');
+
+        const button = document.getElementById('verifyDomainHealthBtn');
+        const previousLabel = button?.textContent || 'Verify DNS Health';
+        if (button) {
+          button.disabled = true;
+          button.textContent = 'Verifying...';
+        }
+
+        try {
+          syncCurrentDomainWorkspaceToState({ serverId, ipId });
+          const result = await apiVerifyNamecheapDomain({
+            config,
+            domain,
+            ipAddress: ipRecord.ip,
+            helo,
+            selector,
+            spf,
+            dmarc,
+            publicKey,
+            ttl: 1800,
+          });
+          const editingDomain = state.selected.type === 'domain'
+            ? state.data.domains.find(x => x.id === state.selected.id) || null
+            : null;
+          if (editingDomain) {
+            editingDomain.verification = result;
+            editingDomain.namecheapLastCheckedAt = result.checkedAt || new Date().toISOString();
+            editingDomain.namecheapSnapshot = result.snapshot || { records: [] };
+          }
+          state.data.snapshots.push({
+            id: uid('snap'),
+            serverId,
+            domain,
+            type: 'namecheap_dns_snapshot',
+            raw: JSON.stringify(result.snapshot || {}, null, 2),
+            parsedAt: Date.now(),
+          });
+          await saveData();
+          renderOverview();
+          renderDnsSummary(editingDomain || state.data.domains.find(x => x.domain === domain) || null);
+          renderReadiness(editingDomain || state.data.domains.find(x => x.domain === domain) || null);
+          alert(result.message || 'DNS verification completed.');
+        } catch (error) {
+          alert(error.message || 'Failed to verify Namecheap DNS records');
+        } finally {
+          if (button) {
+            button.disabled = false;
+            button.textContent = previousLabel;
+          }
         }
       }
 
@@ -5223,6 +5705,15 @@ def api_namecheap_poll_domain():
     payload = request.get_json(silent=True) or {}
     try:
         return jsonify(poll_namecheap_dns(payload))
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+
+
+@app.route('/api/namecheap/verify-domain', methods=['POST'])
+def api_namecheap_verify_domain():
+    payload = request.get_json(silent=True) or {}
+    try:
+        return jsonify(build_domain_verification(payload))
     except Exception as exc:
         return jsonify({'ok': False, 'error': str(exc)}), 400
 
