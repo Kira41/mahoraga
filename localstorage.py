@@ -3737,21 +3737,60 @@ def default_data():
     }
 
 
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode = WAL')
+    conn.execute('PRAGMA synchronous = NORMAL')
+    return conn
+
+
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db_connection() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS app_storage (
                 storage_key TEXT PRIMARY KEY,
-                payload TEXT NOT NULL
+                payload TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        columns = {row['name'] for row in conn.execute("PRAGMA table_info(app_storage)").fetchall()}
+        if 'created_at' not in columns:
+            conn.execute("ALTER TABLE app_storage ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        if 'updated_at' not in columns:
+            conn.execute("ALTER TABLE app_storage ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         conn.commit()
 
 
+def normalize_data(data):
+    if not isinstance(data, dict):
+        raise ValueError("Invalid JSON payload")
+
+    normalized = default_data()
+    normalized.update(data)
+
+    for field in ['servers', 'ips', 'domains', 'domainRegistry', 'snapshots']:
+        value = normalized.get(field)
+        if value is None:
+            normalized[field] = []
+        elif not isinstance(value, list):
+            raise ValueError(f"Field '{field}' must be a list")
+
+    drafts = normalized.get('domainDraftsByIp')
+    if drafts is None:
+        normalized['domainDraftsByIp'] = {}
+    elif not isinstance(drafts, dict):
+        raise ValueError("Field 'domainDraftsByIp' must be an object")
+
+    return normalized
+
+
 def get_data():
-    with sqlite3.connect(DB_PATH) as conn:
+    init_db()
+    with get_db_connection() as conn:
         row = conn.execute(
             "SELECT payload FROM app_storage WHERE storage_key = ?",
             (STORAGE_KEY,),
@@ -3759,30 +3798,29 @@ def get_data():
     if not row:
         return default_data()
     try:
-        payload = json.loads(row[0])
-        if not isinstance(payload, dict):
-            return default_data()
-        base = default_data()
-        base.update(payload)
-        if not isinstance(base.get("domainDraftsByIp"), dict):
-            base["domainDraftsByIp"] = {}
-        return base
+        payload = json.loads(row["payload"])
+        return normalize_data(payload)
     except Exception:
         return default_data()
 
 
 def set_data(data):
-    payload = json.dumps(data, ensure_ascii=False)
-    with sqlite3.connect(DB_PATH) as conn:
+    normalized = normalize_data(data)
+    payload = json.dumps(normalized, ensure_ascii=False)
+    init_db()
+    with get_db_connection() as conn:
         conn.execute(
             """
-            INSERT INTO app_storage (storage_key, payload)
-            VALUES (?, ?)
-            ON CONFLICT(storage_key) DO UPDATE SET payload = excluded.payload
+            INSERT INTO app_storage (storage_key, payload, created_at, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(storage_key) DO UPDATE SET
+                payload = excluded.payload,
+                updated_at = CURRENT_TIMESTAMP
             """,
             (STORAGE_KEY, payload),
         )
         conn.commit()
+    return normalized
 
 
 @app.route('/')
@@ -3798,23 +3836,21 @@ def api_get_data():
 @app.route('/api/data', methods=['POST'])
 def api_post_data():
     payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify({"ok": False, "error": "Invalid JSON payload"}), 400
-    merged = default_data()
-    merged.update(payload)
-    if not isinstance(merged.get('domainDraftsByIp'), dict):
-        merged['domainDraftsByIp'] = {}
-    for key in ['servers', 'ips', 'domains', 'domainRegistry', 'snapshots']:
-        if not isinstance(merged.get(key), list):
-            return jsonify({"ok": False, "error": f"Field '{key}' must be a list"}), 400
-    set_data(merged)
-    return jsonify({"ok": True})
+    if payload is None and request.data:
+        try:
+            payload = json.loads(request.data.decode('utf-8'))
+        except Exception:
+            payload = None
+    try:
+        saved = set_data(payload)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "data": saved})
 
 
 @app.route('/api/data', methods=['DELETE'])
 def api_delete_data():
-    set_data(default_data())
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "data": set_data(default_data())})
 
 
 @app.route('/api/dkim/check-ssh', methods=['POST'])
