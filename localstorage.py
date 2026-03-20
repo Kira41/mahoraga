@@ -3219,6 +3219,69 @@ HTML = r'''<!DOCTYPE html>
         updateDomainMissingNotice();
       }
 
+      function getDomainWorkspaceFormValues() {
+        const ipId = document.getElementById('domainIpSelect')?.value || '';
+        const ipRecord = state.data.ips.find(ip => ip.id === ipId) || null;
+        return {
+          serverId: document.getElementById('domainServerSelect')?.value || ipRecord?.serverId || '',
+          ipId,
+          domain: normalizeDomain(document.getElementById('domainName')?.value || ''),
+          vmta: document.getElementById('domainVmta')?.value.trim() || '',
+          helo: document.getElementById('domainHelo')?.value.trim() || '',
+          selector: document.getElementById('domainSelector')?.value.trim() || 'dkim',
+          pemPath: document.getElementById('domainPemPath')?.value.trim() || '',
+          dmarc: document.getElementById('domainDmarc')?.value.trim() || '',
+          spf: document.getElementById('domainSpf')?.value.trim() || '',
+          ptr: document.getElementById('domainPtr')?.value.trim() || '',
+          publicKey: document.getElementById('domainPublicKey')?.value.trim() || '',
+        };
+      }
+
+      function syncCurrentDomainWorkspaceToState(overrides = {}) {
+        const values = { ...getDomainWorkspaceFormValues(), ...overrides };
+        const editingDomain = state.selected.type === 'domain'
+          ? state.data.domains.find(x => x.id === state.selected.id) || null
+          : null;
+
+        if (editingDomain) {
+          Object.assign(editingDomain, {
+            serverId: values.serverId || editingDomain.serverId,
+            ipId: values.ipId || editingDomain.ipId,
+            domain: values.domain || editingDomain.domain,
+            vmta: values.vmta || editingDomain.vmta,
+            helo: values.helo || editingDomain.helo,
+            selector: values.selector || editingDomain.selector || 'dkim',
+            pemPath: values.pemPath || editingDomain.pemPath,
+            dmarc: values.dmarc || editingDomain.dmarc,
+            spf: values.spf || editingDomain.spf,
+            ptr: values.ptr || editingDomain.ptr,
+            publicKey: values.publicKey || editingDomain.publicKey || '',
+          });
+          return editingDomain;
+        }
+
+        if (!values.ipId) return null;
+        const ipRecord = state.data.ips.find(ip => ip.id === values.ipId) || null;
+        if (!ipRecord) return null;
+        const existingDraft = state.data.domainDraftsByIp?.[values.ipId] || buildDomainDraftFromIp(ipRecord.serverId, ipRecord);
+        if (!existingDraft) return null;
+        state.data.domainDraftsByIp[values.ipId] = {
+          ...existingDraft,
+          serverId: values.serverId || existingDraft.serverId || ipRecord.serverId,
+          ipId: values.ipId,
+          domain: values.domain || existingDraft.domain,
+          vmta: values.vmta || existingDraft.vmta,
+          helo: values.helo || existingDraft.helo,
+          selector: values.selector || existingDraft.selector || 'dkim',
+          pemPath: values.pemPath || existingDraft.pemPath,
+          dmarc: values.dmarc || existingDraft.dmarc,
+          spf: values.spf || existingDraft.spf,
+          ptr: values.ptr || existingDraft.ptr,
+          publicKey: values.publicKey || existingDraft.publicKey || '',
+        };
+        return state.data.domainDraftsByIp[values.ipId];
+      }
+
       function updateDomainMissingNotice() {
         const notice = document.getElementById('domainMissingNotice');
         const domain = normalizeDomain(document.getElementById('domainName')?.value || '');
@@ -3467,6 +3530,14 @@ HTML = r'''<!DOCTYPE html>
           if (publicKeyField) publicKeyField.value = item.publicKey || '';
           if (pemPathField) pemPathField.value = item.remotePath || '';
           if (selectorField) selectorField.value = item.selector || 'dkim';
+          syncCurrentDomainWorkspaceToState({
+            serverId,
+            domain,
+            selector: item.selector || 'dkim',
+            pemPath: item.remotePath || '',
+            publicKey: item.publicKey || '',
+          });
+          await saveData();
           updateDomainMissingNotice();
           alert(`DKIM generated successfully for ${domain}`);
         } catch (error) {
@@ -3503,6 +3574,7 @@ HTML = r'''<!DOCTYPE html>
         }
 
         try {
+          syncCurrentDomainWorkspaceToState({ serverId: document.getElementById('domainServerSelect')?.value || '', ipId });
           const result = await apiPollNamecheapDomain({
             config,
             domain,
