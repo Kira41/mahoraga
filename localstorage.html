@@ -322,6 +322,12 @@
       box-shadow: 0 30px 80px rgba(0,0,0,.45);
       overflow: hidden;
     }
+    .modal.modal-xl {
+      width: min(1380px, 100%);
+      max-height: calc(100vh - 48px);
+      display: flex;
+      flex-direction: column;
+    }
     .modal-header {
       display: flex;
       align-items: flex-start;
@@ -343,6 +349,9 @@
       box-shadow: none;
     }
     .modal-body { padding: 20px; }
+    .modal.modal-xl .modal-body {
+      overflow: auto;
+    }
     .modal-actions {
       display: flex;
       gap: 10px;
@@ -362,6 +371,44 @@
       flex-wrap: wrap;
       margin-top: 14px;
     }
+    .bulk-dkim-grid { display: grid; gap: 16px; }
+    .bulk-dkim-results { display: grid; gap: 12px; }
+    .bulk-dkim-item {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #0f1728;
+      padding: 14px;
+    }
+    .bulk-dkim-item .kv-row strong,
+    .bulk-dkim-item pre {
+      direction: ltr;
+      text-align: left;
+    }
+    .bulk-dkim-table { width: 100%; border-collapse: collapse; }
+    .bulk-dkim-table th, .bulk-dkim-table td {
+      border-bottom: 1px solid rgba(255,255,255,.06);
+      padding: 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    .bulk-dkim-table th {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }
+    .bulk-dkim-table input { min-width: 0; }
+    .bulk-dkim-table .btn-danger { width: 100%; }
+    .bulk-dkim-copy-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    .pre-box {
+      margin-top: 8px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #0b1220;
+      padding: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
 
     @media (max-width: 1200px) {
       .grid-4, .row, .qm-layout, .overview-grid, .registry-monitor { grid-template-columns: 1fr; }
@@ -380,7 +427,7 @@
         <button id="importBtn">Import JSON</button>
         <button id="seedBtn">Load Sample Data</button>
         <button id="domainsRegistryBtn">Domains</button>
-        <button id="resetBtn" class="btn-danger">Clear All Local Storage Data</button>
+        <button id="bulkDkimBtn" class="btn-danger">Bulk DKIM generator</button>
       </div>
     </div>
 
@@ -518,6 +565,7 @@
         <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px">
           <button id="generateCurrentDomainPmtaBtn">Generate PMTA for Selected Domain</button>
           <button id="generateServerPmtaBtn" class="btn-primary">Generate PMTA for Selected Server</button>
+          <button id="pollPmtaInServerBtn" class="btn-warning">Polling in Server</button>
         </div>
         <textarea id="generatedOutput" class="textarea-lg" placeholder="Generated output will appear here"></textarea>
       </div>
@@ -593,12 +641,31 @@
     </div>
   </div>
 
-  <script>
-    document.addEventListener('DOMContentLoaded', () => {
-      const STORAGE_KEY = 'mailInfraDashboardDataV4';
+  <div class="modal-overlay" id="bulkDkimOverlay">
+    <div class="modal modal-xl">
+      <div class="modal-header">
+        <div>
+          <h3>Bulk DKIM generator</h3>
+          <p>Standalone DKIM generator injected into the dashboard. It reuses the selected server SSH settings when available and can generate/upload one or many DKIM keys.</p>
+        </div>
+        <button id="bulkDkimCloseBtn" class="modal-close">×</button>
+      </div>
+      <div class="modal-body">
+        <div id="bulkDkimNotice" class="notice">Ready.</div>
+        <div id="bulkDkimContent" style="margin-top:16px;"></div>
+      </div>
+      <div class="modal-actions">
+        <button id="bulkDkimCloseFooterBtn">Close</button>
+      </div>
+    </div>
+  </div>
 
+  <script>
+    document.addEventListener('DOMContentLoaded', async () => {
+      const STORAGE_KEY = 'mailInfraDashboardDataV4';
+      const PMTA_REMOTE_CONFIG_PATH = '/etc/pmta/config';
       const state = {
-        data: loadData(),
+        data: defaultData(),
         selected: { type: null, id: null },
         pmtaParsed: null,
         treeCollapsed: false,
@@ -610,7 +677,63 @@
         registryPage: 1,
         registryPageSize: 5,
         modalMode: null,
+        bulkDkimResults: null,
       };
+
+      async function apiGetData() {
+        const response = await fetch('/api/data');
+        if (!response.ok) throw new Error('Failed to load data from backend');
+        return await response.json();
+      }
+
+      async function apiSaveData(payload) {
+        const response = await fetch('/api/data', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) throw new Error('Failed to save data into backend');
+        return await response.json();
+      }
+
+      async function apiResetData() {
+        const response = await fetch('/api/data', { method: 'DELETE' });
+        if (!response.ok) throw new Error('Failed to clear backend data');
+        return await response.json();
+      }
+
+      async function apiCheckSsh(payload) {
+        const response = await fetch('/api/dkim/check-ssh', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'SSH check failed');
+        return data;
+      }
+
+      async function apiGenerateDkim(payload) {
+        const response = await fetch('/api/dkim/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'DKIM generation failed');
+        return data;
+      }
+
+      async function apiPollPmtaConfig(payload) {
+        const response = await fetch('/api/pmta/poll-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'PowerMTA config polling failed');
+        return data;
+      }
 
       function uid(prefix = 'id') {
         return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
@@ -627,24 +750,102 @@
         };
       }
 
-      function loadData() {
+      function safeArray(value) {
+        return Array.isArray(value) ? value : [];
+      }
+
+      function loadDataFromBackendObject(obj) {
+        const parsed = obj || defaultData();
+        return {
+          ...defaultData(),
+          ...parsed,
+          servers: safeArray(parsed.servers),
+          ips: safeArray(parsed.ips),
+          domains: safeArray(parsed.domains),
+          domainRegistry: safeArray(parsed.domainRegistry),
+          snapshots: safeArray(parsed.snapshots),
+          domainDraftsByIp: parsed.domainDraftsByIp && typeof parsed.domainDraftsByIp === 'object' ? parsed.domainDraftsByIp : {},
+        };
+      }
+
+      function persistDataToLocalCache(data) {
         try {
-          const raw = localStorage.getItem(STORAGE_KEY);
-          if (!raw) return defaultData();
-          const parsed = JSON.parse(raw);
-          return {
-            ...defaultData(),
-            ...parsed,
-            domainDraftsByIp: parsed.domainDraftsByIp || {},
-          };
-        } catch {
-          return defaultData();
+          window.localStorage.setItem(STORAGE_KEY, JSON.stringify(loadDataFromBackendObject(data)));
+        } catch (error) {
+          console.warn('Unable to write local cache:', error);
         }
       }
 
-      function saveData() {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(state.data));
+      function loadDataFromLocalCache() {
+        try {
+          const raw = window.localStorage.getItem(STORAGE_KEY);
+          if (!raw) return null;
+          return loadDataFromBackendObject(JSON.parse(raw));
+        } catch (error) {
+          console.warn('Unable to read local cache:', error);
+          return null;
+        }
+      }
+
+      function clearDataFromLocalCache() {
+        try {
+          window.localStorage.removeItem(STORAGE_KEY);
+        } catch (error) {
+          console.warn('Unable to clear local cache:', error);
+        }
+      }
+
+      function hasMeaningfulData(data) {
+        const normalized = loadDataFromBackendObject(data);
+        return Boolean(
+          normalized.servers.length ||
+          normalized.ips.length ||
+          normalized.domains.length ||
+          normalized.domainRegistry.length ||
+          normalized.snapshots.length ||
+          Object.keys(normalized.domainDraftsByIp || {}).length
+        );
+      }
+
+      async function saveData() {
+        await apiSaveData(state.data);
+        persistDataToLocalCache(state.data);
         renderAll();
+      }
+
+      function getServerById(serverId = '') {
+        return state.data?.servers?.find(server => server.id === serverId) || null;
+      }
+
+      function getServerSshSettings(server = null) {
+        return {
+          sshHost: server?.sshHost || '',
+          sshPort: String(server?.sshPort || 22),
+          sshTimeout: String(server?.sshTimeout || 20),
+          sshUser: server?.sshUser || '',
+          sshPass: server?.sshPass || '',
+          dkimFilename: server?.dkimFilename || 'dkim.pem',
+          keySize: String(server?.keySize || 2048),
+        };
+      }
+
+      function collectSshSettingsFromForm() {
+        return {
+          sshHost: document.getElementById('serverSshHost')?.value.trim() || '',
+          sshPort: document.getElementById('serverSshPort')?.value.trim() || '22',
+          sshTimeout: document.getElementById('serverSshTimeout')?.value.trim() || '20',
+          sshUser: document.getElementById('serverSshUser')?.value.trim() || '',
+          sshPass: document.getElementById('serverSshPass')?.value || '',
+          dkimFilename: document.getElementById('serverDkimFilename')?.value.trim() || 'dkim.pem',
+          keySize: document.getElementById('serverKeySize')?.value || '2048',
+        };
+      }
+
+      function validateSshSettings(settings) {
+        if (!settings.sshHost) throw new Error('Please enter SSH host');
+        if (!settings.sshUser) throw new Error('Please enter SSH username');
+        if (!settings.sshPass) throw new Error('Please enter SSH password');
+        return settings;
       }
 
       function escapeHtml(str = '') {
@@ -756,6 +957,214 @@
         notice.textContent = message;
       }
 
+      function setBulkDkimNotice(message, type = 'default') {
+        const notice = document.getElementById('bulkDkimNotice');
+        if (!notice) return;
+        notice.className = type === 'ok' ? 'notice ok' : type === 'warn' ? 'notice warn' : type === 'err' ? 'notice err' : 'notice';
+        notice.textContent = message;
+      }
+
+      function closeBulkDkimModal() {
+        document.getElementById('bulkDkimOverlay')?.classList.remove('show');
+        setBulkDkimNotice('Ready.');
+      }
+
+      function getBulkDkimDefaultDomains(server = null) {
+        if (!server) return [{ domain: '', selector: 'dkim' }];
+        const linked = state.data.domains
+          .filter(domain => domain.serverId === server.id)
+          .map(domain => ({ domain: domain.domain || '', selector: domain.selector || 'dkim' }));
+        const drafts = state.data.ips
+          .filter(ip => ip.serverId === server.id)
+          .map(ip => state.data.domainDraftsByIp?.[ip.id])
+          .filter(Boolean)
+          .map(draft => ({ domain: draft.domain || '', selector: draft.selector || 'dkim' }));
+        const merged = [...linked, ...drafts].filter(item => item.domain);
+        const unique = [];
+        const seen = new Set();
+        merged.forEach(item => {
+          const key = `${normalizeDomain(item.domain)}__${item.selector || 'dkim'}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            unique.push({ domain: normalizeDomain(item.domain), selector: item.selector || 'dkim' });
+          }
+        });
+        return unique.length ? unique : [{ domain: '', selector: 'dkim' }];
+      }
+
+      function buildBulkDkimRows(rows = [{ domain: '', selector: 'dkim' }]) {
+        return rows.map((row, index) => `
+          <tr>
+            <td><input data-bulk-domain value="${escapeHtml(row.domain || '')}" placeholder="example.com" /></td>
+            <td><input data-bulk-selector value="${escapeHtml(row.selector || 'dkim')}" placeholder="dkim" /></td>
+            <td><button type="button" class="btn-danger" data-bulk-remove-row="${index}">Remove</button></td>
+          </tr>
+        `).join('');
+      }
+
+      function renderBulkDkimModal(server = null, rows = null) {
+        const content = document.getElementById('bulkDkimContent');
+        if (!content) return;
+        const ssh = getServerSshSettings(server);
+        const selectedServerId = server?.id || '';
+        const effectiveRows = rows || getBulkDkimDefaultDomains(server);
+        const bulkResults = state.bulkDkimResults;
+
+        content.innerHTML = `
+          <div class="bulk-dkim-grid">
+            <div class="card">
+              <h2>SSH / SFTP Settings</h2>
+              <div class="sub">These fields mirror DKIM generator settings. Save them in the server workspace to reuse them everywhere.</div>
+              <input id="bulkDkimServerId" type="hidden" value="${escapeHtml(selectedServerId)}" />
+              <div class="row" style="margin-top:12px;">
+                <div>
+                  <label>SSH Host</label>
+                  <input id="bulkSshHost" value="${escapeHtml(ssh.sshHost)}" placeholder="server.example.com" />
+                </div>
+                <div>
+                  <label>Port</label>
+                  <input id="bulkSshPort" type="number" value="${escapeHtml(ssh.sshPort)}" />
+                </div>
+              </div>
+              <div class="row" style="margin-top:12px;">
+                <div>
+                  <label>Timeout (sec)</label>
+                  <input id="bulkSshTimeout" type="number" value="${escapeHtml(ssh.sshTimeout)}" />
+                </div>
+                <div>
+                  <label>Username</label>
+                  <input id="bulkSshUser" value="${escapeHtml(ssh.sshUser)}" />
+                </div>
+              </div>
+              <div class="row" style="margin-top:12px;">
+                <div>
+                  <label>Password</label>
+                  <input id="bulkSshPass" type="password" value="${escapeHtml(ssh.sshPass)}" />
+                </div>
+                <div>
+                  <label>DKIM filename</label>
+                  <input id="bulkDkimFilename" value="${escapeHtml(ssh.dkimFilename)}" />
+                </div>
+              </div>
+              <div class="row" style="margin-top:12px;">
+                <div>
+                  <label>Key size</label>
+                  <select id="bulkKeySize">
+                    <option value="2048" ${ssh.keySize === '2048' ? 'selected' : ''}>2048 (recommended)</option>
+                    <option value="1024" ${ssh.keySize === '1024' ? 'selected' : ''}>1024 (legacy)</option>
+                    <option value="4096" ${ssh.keySize === '4096' ? 'selected' : ''}>4096</option>
+                  </select>
+                </div>
+                <div>
+                  <label>Selected Server</label>
+                  <input value="${escapeHtml(server?.name || 'No server selected')}" class="readonly" readonly />
+                </div>
+              </div>
+              <div class="inline-actions" style="margin-top:14px;">
+                <button id="bulkCheckSshBtn">Check SSH Connection</button>
+                <button id="bulkSaveToServerBtn" class="btn-warning" ${selectedServerId ? '' : 'disabled'}>Save SSH to Selected Server</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <h2>Domains + DKIM Selector</h2>
+              <div class="sub">Bulk mode keeps the original DKIM generator behavior. For PTR-driven workflow inside Quick Management, single-domain generation runs automatically.</div>
+              <table class="bulk-dkim-table">
+                <thead>
+                  <tr>
+                    <th>Domain</th>
+                    <th>Selector</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="bulkDkimRows">${buildBulkDkimRows(effectiveRows)}</tbody>
+              </table>
+              <div class="inline-actions" style="margin-top:14px;">
+                <button id="bulkAddRowBtn">+ Add domain</button>
+                <button id="bulkGenerateBtn" class="btn-primary">Generate + Upload</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <h2>Results</h2>
+              ${bulkResults?.items?.length ? `
+                <div class="sub">${escapeHtml(bulkResults.sshSummary || '')}</div>
+                <div class="bulk-dkim-results">
+                  ${bulkResults.items.map((item, index) => `
+                    <div class="bulk-dkim-item">
+                      <div class="kv">
+                        <div class="kv-row"><span>Domain</span><strong>${escapeHtml(item.domain)}</strong></div>
+                        <div class="kv-row"><span>Selector</span><strong>${escapeHtml(item.selector)}</strong></div>
+                        <div class="kv-row"><span>Private key path</span><strong>${escapeHtml(item.remotePath)}</strong></div>
+                        <div class="kv-row"><span>Status</span><strong>${item.ok ? 'Uploaded' : 'Failed'}</strong></div>
+                        ${item.error ? `<div class="kv-row"><span>Error</span><strong>${escapeHtml(item.error)}</strong></div>` : ''}
+                      </div>
+                      <div class="pre-box" id="bulkRecordHost_${index}">${escapeHtml(item.recordHostFull || '-')}</div>
+                      <div class="pre-box" id="bulkRecordValue_${index}">${escapeHtml(item.recordValue || '-')}</div>
+                      <div class="pre-box" id="bulkRecordSplit_${index}">${escapeHtml(item.recordValueSplit || '-')}</div>
+                      <div class="bulk-dkim-copy-row">
+                        <button data-copy-target="bulkRecordHost_${index}">Copy Host</button>
+                        <button data-copy-target="bulkRecordValue_${index}" class="btn-primary">Copy Value</button>
+                        <button data-copy-target="bulkRecordSplit_${index}">Copy Split</button>
+                      </div>
+                    </div>
+                  `).join('')}
+                </div>
+              ` : `<div class="notice">No generated rows yet.</div>`}
+            </div>
+          </div>
+        `;
+      }
+
+      function openBulkDkimModal() {
+        const server = getCurrentContextServer();
+        state.bulkDkimResults = null;
+        renderBulkDkimModal(server);
+        document.getElementById('bulkDkimOverlay')?.classList.add('show');
+        setBulkDkimNotice(server ? `Using SSH defaults from server: ${server.name}` : 'Open a server first to prefill SSH settings automatically.', server ? 'ok' : 'warn');
+      }
+
+      function collectBulkDkimPayload() {
+        const rows = Array.from(document.querySelectorAll('#bulkDkimRows tr')).map(row => ({
+          domain: row.querySelector('[data-bulk-domain]')?.value.trim() || '',
+          selector: row.querySelector('[data-bulk-selector]')?.value.trim() || 'dkim',
+        })).filter(item => item.domain);
+
+        return {
+          serverId: document.getElementById('bulkDkimServerId')?.value || '',
+          sshHost: document.getElementById('bulkSshHost')?.value.trim() || '',
+          sshPort: document.getElementById('bulkSshPort')?.value.trim() || '22',
+          sshTimeout: document.getElementById('bulkSshTimeout')?.value.trim() || '20',
+          sshUser: document.getElementById('bulkSshUser')?.value.trim() || '',
+          sshPass: document.getElementById('bulkSshPass')?.value || '',
+          dkimFilename: document.getElementById('bulkDkimFilename')?.value.trim() || 'dkim.pem',
+          keySize: document.getElementById('bulkKeySize')?.value || '2048',
+          domains: rows,
+        };
+      }
+
+      function writeSshSettingsToServer(serverId, payload) {
+        const server = getServerById(serverId);
+        if (!server) throw new Error('Select a server first');
+        server.sshHost = payload.sshHost;
+        server.sshPort = Number(payload.sshPort || 22);
+        server.sshTimeout = Number(payload.sshTimeout || 20);
+        server.sshUser = payload.sshUser;
+        server.sshPass = payload.sshPass;
+        server.dkimFilename = payload.dkimFilename || 'dkim.pem';
+        server.keySize = Number(payload.keySize || 2048);
+      }
+
+      async function generateSingleDkimForDomain(serverId, domain) {
+        const server = getServerById(serverId);
+        if (!server) throw new Error('Please select a server first');
+        const payload = { ...validateSshSettings(getServerSshSettings(server)), domains: [{ domain, selector: 'dkim' }] };
+        const result = await apiGenerateDkim(payload);
+        const item = result.items?.[0];
+        if (!item?.ok) throw new Error(item?.error || 'DKIM generation failed');
+        return item;
+      }
+
       function getCurrentExportJson() {
         return JSON.stringify(state.data, null, 2);
       }
@@ -770,8 +1179,10 @@
         URL.revokeObjectURL(url);
       }
 
-      function safeArray(value) {
-        return Array.isArray(value) ? value : [];
+      async function copyElementText(elementId) {
+        const text = document.getElementById(elementId)?.textContent?.trim() || '';
+        if (!text) throw new Error('Nothing to copy');
+        await navigator.clipboard.writeText(text);
       }
 
       function normalizeImportedData(parsed) {
@@ -889,11 +1300,12 @@
         return normalizeImportedData(parsed);
       }
 
-      function handleMergeImport() {
+      async function handleMergeImport() {
         try {
           const imported = parseJsonTextarea();
           state.data = mergeImportedData(imported);
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(state.data));
+          await apiSaveData(state.data);
+          persistDataToLocalCache(state.data);
           setJsonModalNotice('Data merged successfully with the existing dataset.', 'ok');
           renderAll();
         } catch (error) {
@@ -901,7 +1313,7 @@
         }
       }
 
-      function handleReplaceImport() {
+      async function handleReplaceImport() {
         try {
           const imported = parseJsonTextarea();
           state.data = normalizeImportedData(imported);
@@ -913,7 +1325,8 @@
           state.expandedIps = {};
           state.selectedRegistryDomainId = null;
           state.registryPage = 1;
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(state.data));
+          await apiSaveData(state.data);
+          persistDataToLocalCache(state.data);
           setJsonModalNotice('Existing data was replaced successfully with the new JSON dataset.', 'ok');
           renderAll();
         } catch (error) {
@@ -990,6 +1403,75 @@
         return { score: Math.round(okCount / checks.length * 100), checks };
       }
 
+      function getDomainMissingChecks(domain) {
+        return getDomainReadiness(domain).checks.filter(check => !check.ok);
+      }
+
+      function getDomainMissingBadge(domain) {
+        const missingChecks = getDomainMissingChecks(domain);
+        if (!missingChecks.length) return '';
+        return statusBadge(`Missing ${missingChecks.length}`, 'err');
+      }
+
+      function getDraftMissingChecks(draft) {
+        if (!draft) return [];
+        const checks = [
+          { label: 'Domain valid', ok: isValidDomain(draft.domain) },
+          { label: 'VMTA exists', ok: !!draft.vmta?.trim() },
+          { label: 'HELO exists', ok: !!draft.helo?.trim() },
+          { label: 'PTR exists', ok: !!draft.ptr?.trim() },
+          { label: 'SPF valid', ok: /^v=spf1\s+/i.test(draft.spf || '') },
+          { label: 'DMARC valid', ok: /^v=DMARC1\s*;/i.test(draft.dmarc || '') },
+          { label: 'DKIM selector', ok: !!draft.selector?.trim() },
+          { label: 'DKIM path valid', ok: isValidPemPath(draft.domain, draft.pemPath) },
+          { label: 'Public key present', ok: !!draft.publicKey?.trim() },
+        ];
+        return checks.filter(check => !check.ok);
+      }
+
+      function getIpMissingCount(ip, linkedDomains = null, draft = null) {
+        const domains = linkedDomains || state.data.domains.filter(domain => domain.ipId === ip.id);
+        const draftRecord = draft ?? state.data.domainDraftsByIp?.[ip.id] ?? null;
+        const domainMissingCount = domains.reduce((total, domain) => total + getDomainMissingChecks(domain).length, 0);
+        const draftMissingCount = domains.length ? 0 : getDraftMissingChecks(draftRecord).length;
+        return domainMissingCount + draftMissingCount;
+      }
+
+      function getServerMissingCount(server, ips = null, domains = null) {
+        const serverIps = ips || state.data.ips.filter(ip => ip.serverId === server.id);
+        const serverDomains = domains || state.data.domains.filter(domain => domain.serverId === server.id);
+        const domainMissingCount = serverDomains.reduce((total, domain) => total + getDomainMissingChecks(domain).length, 0);
+        const draftMissingCount = serverIps.reduce((total, ip) => {
+          const hasLinkedDomain = serverDomains.some(domain => domain.ipId === ip.id);
+          if (hasLinkedDomain) return total;
+          return total + getDraftMissingChecks(state.data.domainDraftsByIp?.[ip.id] || null).length;
+        }, 0);
+        return domainMissingCount + draftMissingCount;
+      }
+
+      function getCurrentSelectedServerId() {
+        if (state.selected.type === 'server') return state.selected.id || null;
+        if (state.selected.type === 'ip') return state.data.ips.find(x => x.id === state.selected.id)?.serverId || null;
+        if (state.selected.type === 'domain') return state.data.domains.find(x => x.id === state.selected.id)?.serverId || null;
+        return null;
+      }
+
+      function getServerConfigStatus(server) {
+        if (!server) return { required: false, missing: false, synced: false, generatedConfig: '' };
+        const generatedConfig = generatePmtaForServer(server.id) || '';
+        if (!generatedConfig) return { required: false, missing: false, synced: false, generatedConfig: '' };
+        const fingerprint = generatedConfig.trim();
+        const synced = Boolean(server.pmtaConfigPolledAt && server.pmtaConfigFingerprint === fingerprint);
+        return {
+          required: true,
+          missing: !synced,
+          synced,
+          generatedConfig,
+          polledAt: server.pmtaConfigPolledAt || '',
+          remotePath: server.pmtaConfigRemotePath || '',
+        };
+      }
+
       function statusBadge(text, cls = 'muted') {
         return `<span class="status ${cls}">${escapeHtml(text)}</span>`;
       }
@@ -1001,16 +1483,18 @@
       }
 
       function findLinkedServerNameForDomain(domainName) {
-        const direct = state.data.domains.find(d => normalizeDomain(d.domain) === normalizeDomain(domainName));
+        const data = state.data || defaultData();
+        const direct = data.domains.find(d => normalizeDomain(d.domain) === normalizeDomain(domainName));
         if (!direct) return '';
-        const server = state.data.servers.find(s => s.id === direct.serverId);
+        const server = data.servers.find(s => s.id === direct.serverId);
         return server?.name || '';
       }
 
       function findLinkedIpsForDomain(domainName) {
-        return state.data.domains
+        const data = state.data || defaultData();
+        return data.domains
           .filter(d => normalizeDomain(d.domain) === normalizeDomain(domainName))
-          .map(d => state.data.ips.find(ip => ip.id === d.ipId)?.ip || '')
+          .map(d => data.ips.find(ip => ip.id === d.ipId)?.ip || '')
           .filter(Boolean);
       }
 
@@ -1143,7 +1627,7 @@
       }
 
       function calcStats() {
-        const { servers, ips, domains } = state.data;
+        const { servers, ips, domains } = state.data || defaultData();
         let ready = 0, partial = 0, broken = 0;
         domains.forEach(d => {
           const r = getDomainReadiness(d);
@@ -1198,10 +1682,62 @@
 
       function buildServerForm(server = null) {
         const expiryStatus = getServerExpiryStatus(server?.expiryDate || '');
+        const ssh = getServerSshSettings(server);
         return `
           ${buildWorkspaceNav('server', server)}
-          <div class="notice">Create a server root node. Provider account user helps identify which provider account owns this server.</div>
+          <div class="notice">Create a server root node. The SSH section is now embedded here because DKIM generation depends on the selected server connection.</div>
           <div class="divider"></div>
+          <h4>SSH / DKIM Settings</h4>
+          <div class="sub">These settings are reused by the Bulk DKIM generator and by the automatic single-domain DKIM generation triggered from PTR.</div>
+          <div class="row">
+            <div>
+              <label>SSH Host</label>
+              <input id="serverSshHost" placeholder="server.example.com" value="${escapeHtml(ssh.sshHost)}" />
+            </div>
+            <div>
+              <label>SSH Port</label>
+              <input id="serverSshPort" type="number" placeholder="22" value="${escapeHtml(ssh.sshPort)}" />
+            </div>
+          </div>
+          <div class="row" style="margin-top:12px;">
+            <div>
+              <label>SSH Timeout (sec)</label>
+              <input id="serverSshTimeout" type="number" placeholder="20" value="${escapeHtml(ssh.sshTimeout)}" />
+            </div>
+            <div>
+              <label>SSH Username</label>
+              <input id="serverSshUser" placeholder="root" value="${escapeHtml(ssh.sshUser)}" />
+            </div>
+          </div>
+          <div class="row" style="margin-top:12px;">
+            <div>
+              <label>SSH Password</label>
+              <input id="serverSshPass" type="password" value="${escapeHtml(ssh.sshPass)}" />
+            </div>
+            <div>
+              <label>DKIM filename</label>
+              <input id="serverDkimFilename" value="${escapeHtml(ssh.dkimFilename)}" />
+            </div>
+          </div>
+          <div class="row" style="margin-top:12px;">
+            <div>
+              <label>Key size</label>
+              <select id="serverKeySize">
+                <option value="2048" ${ssh.keySize === '2048' ? 'selected' : ''}>2048 (recommended)</option>
+                <option value="1024" ${ssh.keySize === '1024' ? 'selected' : ''}>1024 (legacy)</option>
+                <option value="4096" ${ssh.keySize === '4096' ? 'selected' : ''}>4096</option>
+              </select>
+            </div>
+            <div>
+              <label>SSH Connection Check</label>
+              <div class="inline-actions">
+                <button id="serverCheckSshBtn" type="button">Check SSH Connection</button>
+                <span id="serverSshStatus" class="status muted">Not checked</span>
+              </div>
+            </div>
+          </div>
+          <div class="divider"></div>
+          <h4>Server Details</h4>
           <div class="row">
             <div>
               <label>Server Name</label>
@@ -1280,7 +1816,7 @@
         const effectiveIp = domain ? state.data.ips.find(ip => ip.id === domain.ipId) || null : preferredIp;
         return `
           ${buildWorkspaceNav('domain', effectiveServer)}
-          <div class="notice">This domain workspace is scoped automatically from the infrastructure tree. Paste the DKIM public key to complete the domain setup.</div>
+          <div class="notice">This domain workspace is scoped automatically from the infrastructure tree. DKIM now generates automatically from PTR using the selected server SSH settings, and you can regenerate it here if needed.</div>
           <div class="divider"></div>
           <div class="small muted">Context: ${escapeHtml(effectiveServer?.name || 'No server')} → ${escapeHtml(effectiveIp?.ip || 'No IP selected')} → Domain Workspace</div>
           <input id="domainServerSelect" type="hidden" value="${escapeHtml(effectiveServer?.id || '')}" />
@@ -1328,7 +1864,15 @@
           </div>
           <div style="margin-top:12px;">
             <label>DKIM Public Key</label>
-            <textarea id="domainPublicKey" placeholder="Paste the DKIM public key here">${escapeHtml(domain?.publicKey || '')}</textarea>
+            <textarea id="domainPublicKey" placeholder="Generated DKIM public key will appear here">${escapeHtml(domain?.publicKey || '')}</textarea>
+          </div>
+          <div id="domainMissingNotice" class="notice ${domain?.publicKey ? 'ok' : 'warn'}" style="margin-top:12px;">
+            ${domain?.publicKey
+              ? 'DKIM public key is present. This domain can be saved without a missing-status warning for DKIM.'
+              : 'Warning: DKIM Public Key is empty. If you do not click "Generate DKIM From PTR Domain", this domain will be saved as Missing in the server tree, IP node, and domain node.'}
+          </div>
+          <div class="inline-actions" style="margin-top:12px;">
+            <button id="generateDomainDkimBtn" type="button">Generate DKIM From PTR Domain</button>
           </div>
           <div style="margin-top:12px;">
             <button id="addDomainBtn" class="btn-primary">${domain ? 'Save Domain' : 'Add Domain'}</button>
@@ -1350,6 +1894,8 @@
           const serverActive = state.selected.type === 'server' && state.selected.id === server.id ? 'active' : '';
           const serverExpanded = !state.treeCollapsed && !!state.expandedServers[server.id];
           const expiryStatus = getServerExpiryStatus(server.expiryDate || '');
+          const serverMissingCount = getServerMissingCount(server, ips, domains);
+          const serverConfigStatus = getServerConfigStatus(server);
           return `
             <div class="tree-node ${serverActive}">
               <div class="tree-node-header" data-select-type="server" data-select-id="${server.id}">
@@ -1360,6 +1906,8 @@
                 <div>
                   <span class="status muted" data-server-toggle="ips" data-server-id="${server.id}">${ips.length} IPs</span>
                   <span class="status muted" data-server-toggle="domains" data-server-id="${server.id}" style="margin-left:6px;">${domains.length} Domains</span>
+                  ${serverConfigStatus.missing ? statusBadge('Config', 'err') : ''}
+                  ${serverMissingCount ? statusBadge(`Missing ${serverMissingCount}`, 'err') : ''}
                   ${statusBadge(expiryStatus.label, expiryStatus.cls)}
                   <span class="status delete" data-delete-type="server" data-delete-id="${server.id}" style="margin-left:6px;">Delete</span>
                 </div>
@@ -1370,6 +1918,7 @@
                   const draft = state.data.domainDraftsByIp?.[ip.id];
                   const ipActive = state.selected.type === 'ip' && state.selected.id === ip.id ? 'active' : '';
                   const ipExpanded = !!state.expandedIps[ip.id];
+                  const ipMissingCount = getIpMissingCount(ip, ipDomains, draft);
                   return `
                     <div class="tree-leaf ${ipActive}" data-select-type="ip" data-select-id="${ip.id}">
                       <div class="tree-leaf-head">
@@ -1377,6 +1926,7 @@
                         <div>
                           ${statusBadge(ip.label || 'No label', 'muted')}
                           <span class="status muted" data-ip-toggle="domains" data-ip-id="${ip.id}" style="margin-left:6px;">${ipDomains.length || (draft ? 1 : 0)} Domains</span>
+                          ${ipMissingCount ? statusBadge(`Missing ${ipMissingCount}`, 'err') : ''}
                           <span class="status delete" data-delete-type="ip" data-delete-id="${ip.id}" style="margin-left:6px;">Delete</span>
                         </div>
                       </div>
@@ -1385,12 +1935,13 @@
                         ${ipDomains.length ? ipDomains.map(domain => {
                           const readiness = getDomainReadiness(domain);
                           const active = state.selected.type === 'domain' && state.selected.id === domain.id ? 'active' : '';
+                          const domainMissingBadge = getDomainMissingBadge(domain);
                           return `
                             <div class="tree-leaf ${active}" data-select-type="domain" data-select-id="${domain.id}">
                               <div class="tree-leaf-head">
                                 <div class="tree-leaf-title ltr">${escapeHtml(domain.domain)}</div>
                                 <div>
-                                  ${statusBadgeByScore(readiness.score)}
+                                  ${domainMissingBadge || statusBadgeByScore(readiness.score)}
                                   <span class="status delete" data-delete-type="domain" data-delete-id="${domain.id}" style="margin-left:6px;">Delete</span>
                                 </div>
                               </div>
@@ -1401,9 +1952,9 @@
                           <div class="tree-leaf" data-open-domain-draft="${ip.id}">
                             <div class="tree-leaf-head">
                               <div class="tree-leaf-title ltr">${escapeHtml(draft.domain)}</div>
-                              <div>${statusBadge('Draft', 'warn')}</div>
+                              <div>${getDraftMissingChecks(draft).length ? statusBadge(`Missing ${getDraftMissingChecks(draft).length}`, 'err') : statusBadge('Draft', 'warn')}</div>
                             </div>
-                            <div class="tree-leaf-meta">Ready for domain completion. Paste the DKIM public key in the workspace and save.</div>
+                            <div class="tree-leaf-meta">Ready for domain completion. Review the generated DKIM public key in the workspace, then save.</div>
                           </div>
                         ` : `<div class="tree-leaf"><div class="tree-leaf-meta">No domain linked to this IP yet.</div></div>`}
                       </div>
@@ -1475,6 +2026,7 @@
           content.innerHTML = buildDomainForm(selectedDomain, contextIp.id, contextServer);
           hydrateDomainAutoFields();
           if (!selectedDomain) autoFillDomainFieldsFromSelectedIp();
+          updateDomainMissingNotice();
           return;
         }
 
@@ -1513,6 +2065,7 @@
           badge.textContent = 'Domain selected';
           content.innerHTML = buildDomainForm(domain, domain?.ipId || '', contextServer);
           hydrateDomainAutoFields();
+          updateDomainMissingNotice();
           return;
         }
       }
@@ -1556,7 +2109,8 @@
               <div class="kv-row"><span>Domains</span><strong>${domains.length}</strong></div>
               <div class="kv-row"><span>Domain drafts</span><strong>${Object.values(state.data.domainDraftsByIp || {}).filter(d => d.serverId === server.id).length}</strong></div>
             </div>`;
-          config.innerHTML = `<h4>Config Snapshot</h4><div class="muted-box">Use PowerMTA Config Studio to compare parsed config rows against this server and detect IP, VMTA, HELO, and DKIM path mismatches.</div>`;
+          const configStatus = getServerConfigStatus(server);
+          config.innerHTML = `<h4>Config Snapshot</h4><div class="muted-box">Use PowerMTA Config Studio to compare parsed config rows against this server and detect IP, VMTA, HELO, and DKIM path mismatches.${configStatus.required ? `<br><br><strong>Polling status:</strong> ${configStatus.missing ? '<span style="color:#ff9d9d">Config missing in server</span>' : '<span style="color:#7ff0bb">Config synced in server</span>'}${configStatus.polledAt ? ` · Last poll: ${escapeHtml(new Date(configStatus.polledAt).toLocaleString())}` : ''}` : '<br><br>This server does not yet have a full 5-domain PowerMTA config ready for polling.'}</div>`;
           return;
         }
 
@@ -1575,7 +2129,7 @@
               <div class="kv-row"><span>HELO</span><strong class="ltr">${escapeHtml(ip.helo || '-')}</strong></div>
             </div>`;
           hierarchy.innerHTML = `<h4>Hierarchy</h4><div class="muted-box">Server <strong>${escapeHtml(server?.name || '-')}</strong> → IP <strong class="ltr">${escapeHtml(ip.ip)}</strong>${draft ? ` → Draft domain <strong class="ltr">${escapeHtml(draft.domain)}</strong>` : ''}</div>`;
-          domainsBox.innerHTML = `<h4>Linked Domains</h4>${domains.length ? `<div class="domain-list-compact">${domains.map(d => `<div class="domain-row"><div class="domain-row-top"><strong class="ltr">${escapeHtml(d.domain)}</strong>${statusBadgeByScore(getDomainReadiness(d).score)}</div><div class="tree-leaf-meta ltr">${escapeHtml(d.vmta || '-')}</div></div>`).join('')}</div>` : draft ? `<div class="muted-box">A draft domain is prepared for this IP: <strong class="ltr">${escapeHtml(draft.domain)}</strong>. Open the domain workspace, paste the DKIM public key, then save.</div>` : `<div class="muted-box">No domain linked to this IP yet.</div>`}`;
+          domainsBox.innerHTML = `<h4>Linked Domains</h4>${domains.length ? `<div class="domain-list-compact">${domains.map(d => `<div class="domain-row"><div class="domain-row-top"><strong class="ltr">${escapeHtml(d.domain)}</strong>${statusBadgeByScore(getDomainReadiness(d).score)}</div><div class="tree-leaf-meta ltr">${escapeHtml(d.vmta || '-')}</div></div>`).join('')}</div>` : draft ? `<div class="muted-box">A draft domain is prepared for this IP: <strong class="ltr">${escapeHtml(draft.domain)}</strong>. Open the domain workspace, review the generated DKIM public key, then save.</div>` : `<div class="muted-box">No domain linked to this IP yet.</div>`}`;
           health.innerHTML = `
             <h4>Health & Readiness</h4>
             <div class="kv">
@@ -1824,6 +2378,14 @@
         };
       }
 
+      function attachDkimResultToDraft(draft, dkimResult) {
+        if (!draft || !dkimResult) return draft;
+        draft.selector = dkimResult.selector || 'dkim';
+        draft.pemPath = dkimResult.remotePath || draft.pemPath;
+        draft.publicKey = dkimResult.publicKey || draft.publicKey || '';
+        return draft;
+      }
+
       function deleteDomain(domainId) {
         const domain = state.data.domains.find(x => x.id === domainId);
         if (!domain) return;
@@ -1875,18 +2437,18 @@
         }
       }
 
-      function handleDeleteAction(type, id) {
+      async function handleDeleteAction(type, id) {
         if (!type || !id) return;
         const confirmed = confirm(`Delete this ${type} and all linked child items?`);
         if (!confirmed) return;
         if (type === 'domain') deleteDomain(id);
         if (type === 'ip') deleteIp(id);
         if (type === 'server') deleteServer(id);
-        saveData();
+        await saveData();
       }
 
       function clearDomainAutoFields() {
-        ['domainName','domainVmta','domainPtr','domainHelo','domainSpf','domainDmarc','domainPemPath','domainSelector'].forEach(id => {
+        ['domainName','domainVmta','domainPtr','domainHelo','domainSpf','domainDmarc','domainPemPath','domainSelector','domainPublicKey'].forEach(id => {
           const el = document.getElementById(id);
           if (el) el.value = id === 'domainSelector' ? 'dkim' : '';
         });
@@ -1915,11 +2477,13 @@
         const ip = state.data.ips.find(x => x.id === ipId);
         if (!ip) {
           clearDomainAutoFields();
+          updateDomainMissingNotice();
           return;
         }
         const draft = state.data.domainDraftsByIp?.[ipId] || buildDomainDraftFromIp(ip.serverId, ip);
         if (!draft) {
           clearDomainAutoFields();
+          updateDomainMissingNotice();
           return;
         }
         const fields = {
@@ -1931,19 +2495,59 @@
           domainDmarc: draft.dmarc,
           domainPemPath: draft.pemPath,
           domainSelector: 'dkim',
+          domainPublicKey: draft.publicKey || '',
         };
         Object.entries(fields).forEach(([id, value]) => {
           const el = document.getElementById(id);
           if (el) el.value = value;
         });
+        updateDomainMissingNotice();
       }
 
-      function addServer() {
+      function updateDomainMissingNotice() {
+        const notice = document.getElementById('domainMissingNotice');
+        const domain = normalizeDomain(document.getElementById('domainName')?.value || '');
+        const publicKey = document.getElementById('domainPublicKey')?.value.trim() || '';
+        if (!notice) return;
+        if (!domain) {
+          notice.className = 'notice warn';
+          notice.textContent = 'Select an IP with a valid PTR first to prepare the domain data and DKIM generation flow.';
+          return;
+        }
+        if (!publicKey) {
+          notice.className = 'notice warn';
+          notice.textContent = 'Warning: DKIM Public Key is empty. If you save now without clicking "Generate DKIM From PTR Domain", this domain will be marked as Missing in the server tree, IP node, and domain node.';
+          return;
+        }
+        notice.className = 'notice ok';
+        notice.textContent = 'DKIM public key is present. The domain no longer has a DKIM missing warning.';
+      }
+
+      async function checkServerSshFromWorkspace() {
+        try {
+          const payload = validateSshSettings(collectSshSettingsFromForm());
+          const result = await apiCheckSsh(payload);
+          const status = document.getElementById('serverSshStatus');
+          if (status) {
+            status.className = 'status ok';
+            status.textContent = result.message || 'Connected';
+          }
+        } catch (error) {
+          const status = document.getElementById('serverSshStatus');
+          if (status) {
+            status.className = 'status err';
+            status.textContent = error.message || 'SSH check failed';
+          }
+        }
+      }
+
+      async function addServer() {
         const name = document.getElementById('serverName')?.value.trim() || '';
         const provider = document.getElementById('serverProvider')?.value.trim() || '';
         const accountUser = document.getElementById('serverAccountUser')?.value.trim() || '';
         const expiryDate = document.getElementById('serverExpiryDate')?.value || '';
         const notes = document.getElementById('serverNotes')?.value.trim() || '';
+        const sshSettings = collectSshSettingsFromForm();
         if (!name) return alert('Please enter a server name');
 
         const editingServer = state.selected.type === 'server'
@@ -1956,19 +2560,43 @@
           editingServer.accountUser = accountUser;
           editingServer.expiryDate = expiryDate;
           editingServer.notes = notes;
+          Object.assign(editingServer, {
+            sshHost: sshSettings.sshHost,
+            sshPort: Number(sshSettings.sshPort || 22),
+            sshTimeout: Number(sshSettings.sshTimeout || 20),
+            sshUser: sshSettings.sshUser,
+            sshPass: sshSettings.sshPass,
+            dkimFilename: sshSettings.dkimFilename,
+            keySize: Number(sshSettings.keySize || 2048),
+          });
           state.selected = { type: 'server', id: editingServer.id };
         } else {
-          const newServer = { id: uid('srv'), name, provider, expiryDate, accountUser, notes, createdAt: Date.now() };
+          const newServer = {
+            id: uid('srv'),
+            name,
+            provider,
+            expiryDate,
+            accountUser,
+            notes,
+            sshHost: sshSettings.sshHost,
+            sshPort: Number(sshSettings.sshPort || 22),
+            sshTimeout: Number(sshSettings.sshTimeout || 20),
+            sshUser: sshSettings.sshUser,
+            sshPass: sshSettings.sshPass,
+            dkimFilename: sshSettings.dkimFilename,
+            keySize: Number(sshSettings.keySize || 2048),
+            createdAt: Date.now(),
+          };
           state.data.servers.push(newServer);
           state.selected = { type: 'server', id: newServer.id };
         }
 
         state.workspaceMode = 'auto';
         state.showWorkspace = true;
-        saveData();
+        await saveData();
       }
 
-      function addIp() {
+      async function addIp() {
         const serverId = document.getElementById('ipServerSelect')?.value || '';
         const ip = document.getElementById('ipAddress')?.value.trim() || '';
         const labelInput = document.getElementById('ipLabel')?.value.trim() || '';
@@ -1992,9 +2620,17 @@
         const label = labelInput || getNextIpLabel(serverId);
         if (!isValidDomain(extractedDomain)) return alert('PTR must contain a valid hostname such as mail.example.com');
 
+        let dkimResult = null;
+        try {
+          dkimResult = await generateSingleDkimForDomain(serverId, extractedDomain);
+        } catch (error) {
+          return alert(error.message || 'Automatic DKIM generation failed');
+        }
+
         if (editingIp) {
           const previousServerId = editingIp.serverId;
           const previousIpId = editingIp.id;
+          const previousExtractedDomain = editingIp.extractedDomain;
           editingIp.serverId = serverId;
           editingIp.ip = ip;
           editingIp.label = label;
@@ -2011,9 +2647,22 @@
           const linkedDomains = state.data.domains.filter(x => x.ipId === previousIpId);
           if (!linkedDomains.length) {
             const draft = buildDomainDraftFromIp(serverId, editingIp);
-            if (draft) state.data.domainDraftsByIp[editingIp.id] = draft;
+            if (draft) state.data.domainDraftsByIp[editingIp.id] = attachDkimResultToDraft(draft, dkimResult);
           } else {
             delete state.data.domainDraftsByIp[editingIp.id];
+            linkedDomains.forEach(domain => {
+              if (!domain.domain || domain.domain === previousExtractedDomain) {
+                domain.domain = extractedDomain;
+                domain.vmta = generateVmtaName(extractedDomain);
+                domain.dmarc = generateDmarcValue(extractedDomain);
+              }
+              domain.helo = helo;
+              domain.spf = `v=spf1 ip4:${ip} ~all`;
+              domain.ptr = ptr;
+              domain.selector = dkimResult.selector || 'dkim';
+              domain.pemPath = dkimResult.remotePath || domain.pemPath;
+              domain.publicKey = dkimResult.publicKey || domain.publicKey || '';
+            });
           }
 
           if (previousServerId !== serverId) {
@@ -2024,16 +2673,16 @@
           const ipRecord = { id: uid('ip'), serverId, ip, label, ptr, helo, extractedDomain, createdAt: Date.now() };
           state.data.ips.push(ipRecord);
           const draft = buildDomainDraftFromIp(serverId, ipRecord);
-          if (draft) state.data.domainDraftsByIp[ipRecord.id] = draft;
+          if (draft) state.data.domainDraftsByIp[ipRecord.id] = attachDkimResultToDraft(draft, dkimResult);
           state.selected = { type: 'ip', id: ipRecord.id };
         }
 
         state.workspaceMode = 'auto';
         state.showWorkspace = true;
-        saveData();
+        await saveData();
       }
 
-      function addDomain() {
+      async function addDomain() {
         const serverId = document.getElementById('domainServerSelect')?.value || '';
         const ipId = document.getElementById('domainIpSelect')?.value || '';
         const domain = normalizeDomain(document.getElementById('domainName')?.value || '');
@@ -2050,7 +2699,9 @@
         if (!ipId) return alert('Please select an IP from the selected server');
         if (!isValidDomain(domain)) return alert('Generated domain is invalid');
         if (!vmta) return alert('Generated Virtual MTA name is missing');
-        if (!publicKey) return alert('Please paste the DKIM public key');
+        if (!publicKey) {
+          alert(`DKIM Public Key is empty for ${domain}. You may have forgotten to click "Generate DKIM From PTR Domain". The domain will still be saved, but it will be marked as Missing under the server, IP, and domain tree nodes until you generate or paste the key.`);
+        }
 
         const editingDomain = state.selected.type === 'domain'
           ? state.data.domains.find(x => x.id === state.selected.id) || null
@@ -2085,10 +2736,30 @@
         delete state.data.domainDraftsByIp[ipId];
         state.workspaceMode = 'auto';
         state.showWorkspace = true;
-        saveData();
+        await saveData();
       }
 
-      function addRegistryDomain() {
+      async function regenerateCurrentDomainDkim() {
+        const serverId = document.getElementById('domainServerSelect')?.value || '';
+        const domain = normalizeDomain(document.getElementById('domainName')?.value || '');
+        if (!serverId) return alert('Please select a server');
+        if (!isValidDomain(domain)) return alert('Generated domain is invalid');
+        try {
+          const item = await generateSingleDkimForDomain(serverId, domain);
+          const publicKeyField = document.getElementById('domainPublicKey');
+          const pemPathField = document.getElementById('domainPemPath');
+          const selectorField = document.getElementById('domainSelector');
+          if (publicKeyField) publicKeyField.value = item.publicKey || '';
+          if (pemPathField) pemPathField.value = item.remotePath || '';
+          if (selectorField) selectorField.value = item.selector || 'dkim';
+          updateDomainMissingNotice();
+          alert(`DKIM generated successfully for ${domain}`);
+        } catch (error) {
+          alert(error.message || 'Failed to generate DKIM');
+        }
+      }
+
+      async function addRegistryDomain() {
         const domain = normalizeDomain(document.getElementById('registryDomainName')?.value || '');
         const provider = document.getElementById('registryDomainProvider')?.value.trim() || '';
         const expiryDate = document.getElementById('registryDomainExpiryDate')?.value || '';
@@ -2099,10 +2770,10 @@
         state.data.domainRegistry.push({ id: uid('regdom'), domain, provider, expiryDate, accountUser, note });
         clearRegistryForm();
         state.registryPage = 1;
-        saveData();
+        await saveData();
       }
 
-      function updateRegistryDomain() {
+      async function updateRegistryDomain() {
         if (!state.selectedRegistryDomainId) return alert('Please choose a registry domain to edit first');
         const item = state.data.domainRegistry.find(x => x.id === state.selectedRegistryDomainId);
         if (!item) return alert('Selected registry domain was not found');
@@ -2119,10 +2790,10 @@
         item.expiryDate = expiryDate;
         item.accountUser = accountUser;
         item.note = note;
-        saveData();
+        await saveData();
       }
 
-      function deleteRegistryDomain(registryId) {
+      async function deleteRegistryDomain(registryId) {
         state.data.domainRegistry = state.data.domainRegistry.filter(x => x.id !== registryId);
         if (state.selectedRegistryDomainId === registryId) clearRegistryForm();
         const providerFilter = document.getElementById('registryProviderFilter')?.value || '';
@@ -2134,7 +2805,7 @@
         }).length;
         const totalPages = Math.max(1, Math.ceil(filteredCount / state.registryPageSize));
         if (state.registryPage > totalPages) state.registryPage = totalPages;
-        saveData();
+        await saveData();
       }
 
       function parsePmtaAction() {
@@ -2147,7 +2818,7 @@
         renderPmtaResults();
       }
 
-      function applyPmtaAction() {
+      async function applyPmtaAction() {
         if (!state.pmtaParsed) return alert('Please parse the config first');
         const serverId = document.getElementById('pmtaServerSelect')?.value || '';
         if (!serverId) return alert('Please select the target server');
@@ -2201,7 +2872,7 @@
           raw: document.getElementById('pmtaConfig')?.value || '',
           parsedAt: Date.now(),
         });
-        saveData();
+        await saveData();
         alert('The config was applied internally to the selected server successfully.');
       }
 
@@ -2219,6 +2890,53 @@
         alert(issues.length ? issues.join('\n') : 'Internal validation looks good.');
       }
 
+      async function pollPmtaConfigInServer() {
+        const serverId = getCurrentSelectedServerId();
+        if (!serverId) return alert('Please select a Server, Domain, or IP linked to a server first');
+        const server = state.data.servers.find(x => x.id === serverId);
+        if (!server) return alert('Server not found');
+
+        const generated = generatePmtaForServer(serverId);
+        if (!generated) return alert('This server needs five valid IP/domain mappings before polling the full config into the server');
+
+        let sshSettings;
+        try {
+          sshSettings = validateSshSettings(getServerSshSettings(server));
+        } catch (error) {
+          return alert(error.message || 'SSH settings are incomplete');
+        }
+
+        renderGeneratedOutput(generated);
+        const confirmed = confirm(`This will replace the full file ${PMTA_REMOTE_CONFIG_PATH} on ${server.name}. Continue?`);
+        if (!confirmed) return;
+
+        const button = document.getElementById('pollPmtaInServerBtn');
+        const previousLabel = button?.textContent || 'Polling in Server';
+        if (button) {
+          button.disabled = true;
+          button.textContent = 'Polling...';
+        }
+
+        try {
+          const result = await apiPollPmtaConfig({
+            ...sshSettings,
+            configContent: generated,
+          });
+          server.pmtaConfigFingerprint = generated.trim();
+          server.pmtaConfigPolledAt = new Date().toISOString();
+          server.pmtaConfigRemotePath = result.remotePath || PMTA_REMOTE_CONFIG_PATH;
+          await saveData();
+          alert(result.message || `PowerMTA config was polled to ${server.name} successfully.`);
+        } catch (error) {
+          alert(error.message || 'Failed to poll PowerMTA config into the server');
+        } finally {
+          if (button) {
+            button.disabled = false;
+            button.textContent = previousLabel;
+          }
+        }
+      }
+
       function generatePmtaForDomain(domain) {
         const ip = state.data.ips.find(i => i.id === domain.ipId);
         if (!ip) return '';
@@ -2229,7 +2947,7 @@
         return generateFullPmtaForServer(serverId);
       }
 
-      function generateFullPmtaForServer(serverId) {
+      function getPmtaGenerationBundle(serverId) {
         function labelRank(label) {
           const clean = String(label || '').toLowerCase().trim();
           if (clean.indexOf('main') >= 0) return 1;
@@ -2279,9 +2997,9 @@
           };
         });
 
-        if (!mappings.length) return '';
-        if (mappings.some(item => !item.domain || !isValidDomain(item.domain))) return '';
-        if (mappings.length < 5) return '';
+        if (!mappings.length) return { output: '', mappings, reason: 'no-mappings' };
+        if (mappings.some(item => !item.domain || !isValidDomain(item.domain))) return { output: '', mappings, reason: 'invalid-domain' };
+        if (mappings.length < 5) return { output: '', mappings, reason: 'needs-five-ips' };
 
         const fallback = mappings[mappings.length - 1];
         let output = getStrictPmtaTemplate();
@@ -2308,7 +3026,11 @@
           output = output.split(placeholder).join(String(value || ''));
         });
 
-        return output;
+        return { output, mappings, reason: '' };
+      }
+
+      function generateFullPmtaForServer(serverId) {
+        return getPmtaGenerationBundle(serverId).output || '';
       }
 
       function getStrictPmtaTemplate() {
@@ -2973,20 +3695,21 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
         openJsonModal('export', getCurrentExportJson());
       }
 
-      function resetAll() {
-        const confirmText = prompt('Type DELETE to remove all local data');
+      async function resetAll() {
+        const confirmText = prompt('Type DELETE to remove all database data');
         if (confirmText !== 'DELETE') return;
-        localStorage.removeItem(STORAGE_KEY);
+        await apiResetData();
+        clearDataFromLocalCache();
         state.data = defaultData();
         state.selected = { type: null, id: null };
         state.pmtaParsed = null;
         state.showWorkspace = false;
         state.workspaceMode = 'auto';
         renderAll();
-        alert('All local data has been removed');
+        alert('All database data has been removed');
       }
 
-      function seedData() {
+      async function seedData() {
         if (state.data.servers.length || state.data.ips.length || state.data.domains.length) {
           const ok = confirm('There is already data stored. Do you want to replace it with sample data?');
           if (!ok) return;
@@ -3034,7 +3757,7 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
         state.selected = { type: 'server', id: srvId };
         state.showWorkspace = true;
         state.workspaceMode = 'auto';
-        saveData();
+        await saveData();
       }
 
       function renderPmtaServerSelect() {
@@ -3057,11 +3780,11 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
         renderDomainsRegistry();
       }
 
-      function handleTreeClick(event) {
+      async function handleTreeClick(event) {
         const deleteTarget = event.target.closest('[data-delete-type][data-delete-id]');
         if (deleteTarget) {
           event.stopPropagation();
-          handleDeleteAction(deleteTarget.dataset.deleteType, deleteTarget.dataset.deleteId);
+          await handleDeleteAction(deleteTarget.dataset.deleteType, deleteTarget.dataset.deleteId);
           return;
         }
         const toggleTarget = event.target.closest('[data-server-toggle][data-server-id]');
@@ -3153,7 +3876,7 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
       function bindEvents() {
         document.getElementById('exportBtn')?.addEventListener('click', exportData);
         document.getElementById('importBtn')?.addEventListener('click', () => openJsonModal('import', ''));
-        document.getElementById('resetBtn')?.addEventListener('click', resetAll);
+        document.getElementById('bulkDkimBtn')?.addEventListener('click', openBulkDkimModal);
         document.getElementById('domainsRegistryBtn')?.addEventListener('click', () => {
           document.querySelectorAll('#mainTabs .tab').forEach(t => t.classList.remove('active'));
           document.getElementById('domainsRegistryTab')?.classList.add('active');
@@ -3184,19 +3907,24 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
           state.showWorkspace = true;
           renderAll();
         });
-        document.getElementById('infraTree')?.addEventListener('click', handleTreeClick);
+        document.getElementById('infraTree')?.addEventListener('click', (e) => { handleTreeClick(e); });
 
         document.getElementById('workspaceContent')?.addEventListener('input', (e) => {
           if (e.target.id === 'ipPtr') {
             const helo = document.getElementById('ipHelo');
             if (helo) helo.value = normalizeDomain(e.target.value.trim());
           }
+          if (e.target.id === 'domainPublicKey') {
+            updateDomainMissingNotice();
+          }
         });
 
-        document.getElementById('workspaceContent')?.addEventListener('click', (e) => {
-          if (e.target.id === 'addServerBtn') addServer();
-          if (e.target.id === 'addIpBtn') addIp();
-          if (e.target.id === 'addDomainBtn') addDomain();
+        document.getElementById('workspaceContent')?.addEventListener('click', async (e) => {
+          if (e.target.id === 'addServerBtn') await addServer();
+          if (e.target.id === 'addIpBtn') await addIp();
+          if (e.target.id === 'addDomainBtn') await addDomain();
+          if (e.target.id === 'serverCheckSshBtn') await checkServerSshFromWorkspace();
+          if (e.target.id === 'generateDomainDkimBtn') await regenerateCurrentDomainDkim();
 
           if (e.target.id === 'openServerWorkspaceBtn') {
             state.workspaceMode = 'auto';
@@ -3231,7 +3959,7 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
           state.registryPage = 1;
           renderDomainsRegistry();
         });
-        document.getElementById('domainsRegistryContent')?.addEventListener('click', (e) => {
+        document.getElementById('domainsRegistryContent')?.addEventListener('click', async (e) => {
           if (e.target.id === 'registryPrevPageBtn') {
             if (state.registryPage > 1) {
               state.registryPage -= 1;
@@ -3269,7 +3997,7 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
           if (action === 'delete') {
             const confirmed = confirm('Delete this registry domain?');
             if (!confirmed) return;
-            deleteRegistryDomain(registryId);
+            await deleteRegistryDomain(registryId);
           }
         });
 
@@ -3288,15 +4016,13 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
           if (domain) renderGeneratedOutput(generatePmtaForDomain(domain));
         });
         document.getElementById('generateServerPmtaBtn')?.addEventListener('click', () => {
-          let serverId = null;
-          if (state.selected.type === 'server') serverId = state.selected.id;
-          if (state.selected.type === 'ip') serverId = state.data.ips.find(x => x.id === state.selected.id)?.serverId || null;
-          if (state.selected.type === 'domain') serverId = state.data.domains.find(x => x.id === state.selected.id)?.serverId || null;
+          const serverId = getCurrentSelectedServerId();
           if (!serverId) return alert('Please select a Server, Domain, or IP linked to a server first');
           const generated = generatePmtaForServer(serverId);
           if (!generated) return alert('This server needs valid IPs and linked domains before generating the full config');
           renderGeneratedOutput(generated);
         });
+        document.getElementById('pollPmtaInServerBtn')?.addEventListener('click', pollPmtaConfigInServer);
 
         document.getElementById('mainTabs')?.addEventListener('click', (e) => {
           const tab = e.target.closest('.tab');
@@ -3308,13 +4034,26 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
           document.getElementById(target)?.classList.add('active');
         });
 
-        document.body.addEventListener('click', (e) => {
+        document.body.addEventListener('click', async (e) => {
           if (e.target.id === 'jsonModalCloseBtn' || e.target.id === 'closeJsonModalBtn') {
             closeJsonModal();
             return;
           }
+          if (e.target.id === 'bulkDkimCloseBtn' || e.target.id === 'bulkDkimCloseFooterBtn' || e.target.id === 'bulkDkimOverlay') {
+            closeBulkDkimModal();
+            return;
+          }
           if (e.target.id === 'copyJsonBtn') {
             copyJsonToClipboard();
+            return;
+          }
+          if (e.target.dataset.copyTarget) {
+            try {
+              await copyElementText(e.target.dataset.copyTarget);
+              setBulkDkimNotice('Copied to clipboard.', 'ok');
+            } catch (error) {
+              setBulkDkimNotice(error.message || 'Clipboard copy failed.', 'err');
+            }
             return;
           }
           if (e.target.id === 'downloadJsonBtn') {
@@ -3323,13 +4062,13 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
             return;
           }
           if (e.target.id === 'mergeJsonBtn') {
-            handleMergeImport();
+            await handleMergeImport();
             return;
           }
           if (e.target.id === 'replaceJsonBtn') {
             const confirmed = confirm('This will replace all current stored data with the new JSON. Continue?');
             if (!confirmed) return;
-            handleReplaceImport();
+            await handleReplaceImport();
             return;
           }
           if (e.target.id === 'formatJsonBtn') {
@@ -3342,6 +4081,67 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
             setJsonModalNotice('Textarea cleared.', 'warn');
             return;
           }
+          if (e.target.id === 'bulkAddRowBtn') {
+            const server = getServerById(document.getElementById('bulkDkimServerId')?.value || '');
+            const rows = Array.from(document.querySelectorAll('#bulkDkimRows tr')).map(row => ({
+              domain: row.querySelector('[data-bulk-domain]')?.value.trim() || '',
+              selector: row.querySelector('[data-bulk-selector]')?.value.trim() || 'dkim',
+            }));
+            rows.push({ domain: '', selector: `s${rows.length + 1}` });
+            renderBulkDkimModal(server, rows);
+            return;
+          }
+          const removeRowBtn = e.target.closest('[data-bulk-remove-row]');
+          if (removeRowBtn) {
+            const server = getServerById(document.getElementById('bulkDkimServerId')?.value || '');
+            const indexToRemove = Number(removeRowBtn.dataset.bulkRemoveRow);
+            const rows = Array.from(document.querySelectorAll('#bulkDkimRows tr')).map(row => ({
+              domain: row.querySelector('[data-bulk-domain]')?.value.trim() || '',
+              selector: row.querySelector('[data-bulk-selector]')?.value.trim() || 'dkim',
+            })).filter((_, index) => index !== indexToRemove);
+            renderBulkDkimModal(server, rows.length ? rows : [{ domain: '', selector: 'dkim' }]);
+            return;
+          }
+          if (e.target.id === 'bulkCheckSshBtn') {
+            try {
+              const payload = validateSshSettings(collectBulkDkimPayload());
+              const result = await apiCheckSsh(payload);
+              setBulkDkimNotice(result.message || 'SSH connection succeeded.', 'ok');
+            } catch (error) {
+              setBulkDkimNotice(error.message || 'SSH connection failed.', 'err');
+            }
+            return;
+          }
+          if (e.target.id === 'bulkSaveToServerBtn') {
+            try {
+              const payload = validateSshSettings(collectBulkDkimPayload());
+              const serverId = payload.serverId || '';
+              writeSshSettingsToServer(serverId, payload);
+              await saveData();
+              setBulkDkimNotice('SSH settings saved into the selected server.', 'ok');
+              renderBulkDkimModal(getServerById(serverId), payload.domains.length ? payload.domains : [{ domain: '', selector: 'dkim' }]);
+            } catch (error) {
+              setBulkDkimNotice(error.message || 'Failed to save SSH settings.', 'err');
+            }
+            return;
+          }
+          if (e.target.id === 'bulkGenerateBtn') {
+            try {
+              const payload = validateSshSettings(collectBulkDkimPayload());
+              if (!payload.domains.length) throw new Error('Please add at least one domain');
+              const result = await apiGenerateDkim(payload);
+              state.bulkDkimResults = result;
+              if (payload.serverId) {
+                writeSshSettingsToServer(payload.serverId, payload);
+                await saveData();
+              }
+              renderBulkDkimModal(getServerById(payload.serverId), payload.domains);
+              setBulkDkimNotice(`Generated ${result.items?.length || 0} DKIM record(s) successfully.`, 'ok');
+            } catch (error) {
+              setBulkDkimNotice(error.message || 'Bulk DKIM generation failed.', 'err');
+            }
+            return;
+          }
           if (e.target.id === 'jsonModalOverlay') {
             closeJsonModal();
           }
@@ -3350,6 +4150,9 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
         document.addEventListener('keydown', (e) => {
           if (e.key === 'Escape' && document.getElementById('jsonModalOverlay')?.classList.contains('show')) {
             closeJsonModal();
+          }
+          if (e.key === 'Escape' && document.getElementById('bulkDkimOverlay')?.classList.contains('show')) {
+            closeBulkDkimModal();
           }
         });
       }
@@ -3366,18 +4169,24 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
         console.assert(findLinkedServerNameForDomain('missing-example.com') === '', 'Linked server fallback failed');
         console.assert(getServerExpiryStatus('2099-01-01').label.includes('Expires in'), 'Expiry future status failed');
         console.assert(Array.isArray(findLinkedIpsForDomain('missing-example.com')) && findLinkedIpsForDomain('missing-example.com').length === 0, 'Linked IP fallback failed');
-        console.assert(escapeDomainForPmtaRegexForTest('101crossroadsstudio.com') === '101crossroadsstudio\\.com', 'Regex escape failed');
-        console.assert(getStrictPmtaTemplate().includes('mail-from /@mail\\.[DOMAIN1_ESC]$/'), 'Template mail dot escaping failed');
-        console.assert(getStrictPmtaTemplate().includes('/\\broute\\b/ routing-errors'), 'Template word boundary escaping failed');
-        console.assert(typeof normalizeImportedData({ servers: [] }).servers !== 'undefined', 'Normalize import failed');
-      }
-
-      function escapeDomainForPmtaRegexForTest(domain) {
-        return String(domain || '').replace(/\./g, '\\.');
       }
 
       bindEvents();
       runSelfTests();
+      const cachedData = loadDataFromLocalCache();
+      try {
+        const backendData = loadDataFromBackendObject(await apiGetData());
+        state.data = backendData;
+        if (hasMeaningfulData(backendData) || !cachedData) {
+          persistDataToLocalCache(backendData);
+        } else {
+          state.data = cachedData;
+          await apiSaveData(state.data);
+          persistDataToLocalCache(state.data);
+        }
+      } catch (error) {
+        state.data = cachedData || defaultData();
+      }
       renderAll();
     });
   </script>
