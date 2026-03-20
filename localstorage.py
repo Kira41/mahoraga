@@ -3759,9 +3759,16 @@ def init_db():
         )
         columns = {row['name'] for row in conn.execute("PRAGMA table_info(app_storage)").fetchall()}
         if 'created_at' not in columns:
-            conn.execute("ALTER TABLE app_storage ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            conn.execute("ALTER TABLE app_storage ADD COLUMN created_at TIMESTAMP")
         if 'updated_at' not in columns:
-            conn.execute("ALTER TABLE app_storage ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            conn.execute("ALTER TABLE app_storage ADD COLUMN updated_at TIMESTAMP")
+
+        conn.execute(
+            "UPDATE app_storage SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"
+        )
+        conn.execute(
+            "UPDATE app_storage SET updated_at = CURRENT_TIMESTAMP WHERE updated_at IS NULL"
+        )
         conn.commit()
 
 
