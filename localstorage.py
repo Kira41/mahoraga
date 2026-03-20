@@ -2120,7 +2120,7 @@ HTML = r'''<!DOCTYPE html>
           badge.textContent = 'Scoped domain form';
           content.innerHTML = buildDomainForm(selectedDomain, contextIp.id, contextServer);
           hydrateDomainAutoFields();
-          autoFillDomainFieldsFromSelectedIp();
+          if (!selectedDomain) autoFillDomainFieldsFromSelectedIp();
           return;
         }
 
@@ -2159,7 +2159,6 @@ HTML = r'''<!DOCTYPE html>
           badge.textContent = 'Domain selected';
           content.innerHTML = buildDomainForm(domain, domain?.ipId || '', contextServer);
           hydrateDomainAutoFields();
-          autoFillDomainFieldsFromSelectedIp();
           return;
         }
       }
