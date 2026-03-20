@@ -852,7 +852,7 @@ HTML = r'''<!DOCTYPE html>
   <script>
     document.addEventListener('DOMContentLoaded', async () => {
       const state = {
-        data: null,
+        data: defaultData(),
         selected: { type: null, id: null },
         pmtaParsed: null,
         treeCollapsed: false,
@@ -1590,16 +1590,18 @@ HTML = r'''<!DOCTYPE html>
       }
 
       function findLinkedServerNameForDomain(domainName) {
-        const direct = state.data.domains.find(d => normalizeDomain(d.domain) === normalizeDomain(domainName));
+        const data = state.data || defaultData();
+        const direct = data.domains.find(d => normalizeDomain(d.domain) === normalizeDomain(domainName));
         if (!direct) return '';
-        const server = state.data.servers.find(s => s.id === direct.serverId);
+        const server = data.servers.find(s => s.id === direct.serverId);
         return server?.name || '';
       }
 
       function findLinkedIpsForDomain(domainName) {
-        return state.data.domains
+        const data = state.data || defaultData();
+        return data.domains
           .filter(d => normalizeDomain(d.domain) === normalizeDomain(domainName))
-          .map(d => state.data.ips.find(ip => ip.id === d.ipId)?.ip || '')
+          .map(d => data.ips.find(ip => ip.id === d.ipId)?.ip || '')
           .filter(Boolean);
       }
 
@@ -1732,7 +1734,7 @@ HTML = r'''<!DOCTYPE html>
       }
 
       function calcStats() {
-        const { servers, ips, domains } = state.data;
+        const { servers, ips, domains } = state.data || defaultData();
         let ready = 0, partial = 0, broken = 0;
         domains.forEach(d => {
           const r = getDomainReadiness(d);
