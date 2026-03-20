@@ -15,6 +15,7 @@ app = Flask(__name__)
 DB_PATH = Path(__file__).with_suffix('.db')
 STORAGE_KEY = 'mailInfraDashboardDataV4'
 REMOTE_BASE_DIR = '/root'
+PMTA_REMOTE_CONFIG_PATH = '/etc/pmta/config'
 DOMAIN_RE = re.compile(r'^(?=.{1,253}$)(?!-)([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$')
 SELECTOR_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$')
 
@@ -175,6 +176,42 @@ def run_dkim_generation(payload: dict):
             'ok': True,
             'sshSummary': f'Connected to {ssh_host}:{ssh_port} (SFTP).',
             'items': results,
+        }
+    finally:
+        try:
+            if sftp:
+                sftp.close()
+        except Exception:
+            pass
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+
+
+def run_pmta_config_polling(payload: dict):
+    ssh_host = (payload.get('sshHost') or '').strip()
+    ssh_user = (payload.get('sshUser') or '').strip()
+    ssh_pass = payload.get('sshPass') or ''
+    ssh_port = clean_int(payload.get('sshPort', 22), 22)
+    ssh_timeout = clean_int(payload.get('sshTimeout', 20), 20)
+    config_content = payload.get('configContent') or ''
+
+    if not ssh_host or not ssh_user:
+        raise ValueError('Missing SSH host or username.')
+    if not str(config_content).strip():
+        raise ValueError('Generated PowerMTA config is empty.')
+
+    client = None
+    sftp = None
+    try:
+        client, sftp = ssh_connect_sftp(ssh_host, ssh_port, ssh_user, ssh_pass, timeout=ssh_timeout)
+        sftp_upload_bytes(sftp, PMTA_REMOTE_CONFIG_PATH, str(config_content).encode('utf-8'))
+        return {
+            'ok': True,
+            'message': f'PowerMTA config was uploaded to {PMTA_REMOTE_CONFIG_PATH} on {ssh_host}:{ssh_port}.',
+            'remotePath': PMTA_REMOTE_CONFIG_PATH,
         }
     finally:
         try:
@@ -755,6 +792,7 @@ HTML = r'''<!DOCTYPE html>
         <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px">
           <button id="generateCurrentDomainPmtaBtn">Generate PMTA for Selected Domain</button>
           <button id="generateServerPmtaBtn" class="btn-primary">Generate PMTA for Selected Server</button>
+          <button id="pollPmtaInServerBtn" class="btn-warning">Polling in Server</button>
         </div>
         <textarea id="generatedOutput" class="textarea-lg" placeholder="Generated output will appear here"></textarea>
       </div>
@@ -851,6 +889,8 @@ HTML = r'''<!DOCTYPE html>
 
   <script>
     document.addEventListener('DOMContentLoaded', async () => {
+      const STORAGE_KEY = 'mailInfraDashboardDataV4';
+      const PMTA_REMOTE_CONFIG_PATH = '/etc/pmta/config';
       const state = {
         data: defaultData(),
         selected: { type: null, id: null },
@@ -908,6 +948,17 @@ HTML = r'''<!DOCTYPE html>
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'DKIM generation failed');
+        return data;
+      }
+
+      async function apiPollPmtaConfig(payload) {
+        const response = await fetch('/api/pmta/poll-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'PowerMTA config polling failed');
         return data;
       }
 
@@ -1625,6 +1676,29 @@ HTML = r'''<!DOCTYPE html>
         return domainMissingCount + draftMissingCount;
       }
 
+      function getCurrentSelectedServerId() {
+        if (state.selected.type === 'server') return state.selected.id || null;
+        if (state.selected.type === 'ip') return state.data.ips.find(x => x.id === state.selected.id)?.serverId || null;
+        if (state.selected.type === 'domain') return state.data.domains.find(x => x.id === state.selected.id)?.serverId || null;
+        return null;
+      }
+
+      function getServerConfigStatus(server) {
+        if (!server) return { required: false, missing: false, synced: false, generatedConfig: '' };
+        const generatedConfig = generatePmtaForServer(server.id) || '';
+        if (!generatedConfig) return { required: false, missing: false, synced: false, generatedConfig: '' };
+        const fingerprint = generatedConfig.trim();
+        const synced = Boolean(server.pmtaConfigPolledAt && server.pmtaConfigFingerprint === fingerprint);
+        return {
+          required: true,
+          missing: !synced,
+          synced,
+          generatedConfig,
+          polledAt: server.pmtaConfigPolledAt || '',
+          remotePath: server.pmtaConfigRemotePath || '',
+        };
+      }
+
       function statusBadge(text, cls = 'muted') {
         return `<span class="status ${cls}">${escapeHtml(text)}</span>`;
       }
@@ -2048,6 +2122,7 @@ HTML = r'''<!DOCTYPE html>
           const serverExpanded = !state.treeCollapsed && !!state.expandedServers[server.id];
           const expiryStatus = getServerExpiryStatus(server.expiryDate || '');
           const serverMissingCount = getServerMissingCount(server, ips, domains);
+          const serverConfigStatus = getServerConfigStatus(server);
           return `
             <div class="tree-node ${serverActive}">
               <div class="tree-node-header" data-select-type="server" data-select-id="${server.id}">
@@ -2058,6 +2133,7 @@ HTML = r'''<!DOCTYPE html>
                 <div>
                   <span class="status muted" data-server-toggle="ips" data-server-id="${server.id}">${ips.length} IPs</span>
                   <span class="status muted" data-server-toggle="domains" data-server-id="${server.id}" style="margin-left:6px;">${domains.length} Domains</span>
+                  ${serverConfigStatus.missing ? statusBadge('Config', 'err') : ''}
                   ${serverMissingCount ? statusBadge(`Missing ${serverMissingCount}`, 'err') : ''}
                   ${statusBadge(expiryStatus.label, expiryStatus.cls)}
                   <span class="status delete" data-delete-type="server" data-delete-id="${server.id}" style="margin-left:6px;">Delete</span>
@@ -2260,7 +2336,8 @@ HTML = r'''<!DOCTYPE html>
               <div class="kv-row"><span>Domains</span><strong>${domains.length}</strong></div>
               <div class="kv-row"><span>Domain drafts</span><strong>${Object.values(state.data.domainDraftsByIp || {}).filter(d => d.serverId === server.id).length}</strong></div>
             </div>`;
-          config.innerHTML = `<h4>Config Snapshot</h4><div class="muted-box">Use PowerMTA Config Studio to compare parsed config rows against this server and detect IP, VMTA, HELO, and DKIM path mismatches.</div>`;
+          const configStatus = getServerConfigStatus(server);
+          config.innerHTML = `<h4>Config Snapshot</h4><div class="muted-box">Use PowerMTA Config Studio to compare parsed config rows against this server and detect IP, VMTA, HELO, and DKIM path mismatches.${configStatus.required ? `<br><br><strong>Polling status:</strong> ${configStatus.missing ? '<span style="color:#ff9d9d">Config missing in server</span>' : '<span style="color:#7ff0bb">Config synced in server</span>'}${configStatus.polledAt ? ` · Last poll: ${escapeHtml(new Date(configStatus.polledAt).toLocaleString())}` : ''}` : '<br><br>This server does not yet have a full 5-domain PowerMTA config ready for polling.'}</div>`;
           return;
         }
 
@@ -3040,6 +3117,53 @@ HTML = r'''<!DOCTYPE html>
         alert(issues.length ? issues.join('\n') : 'Internal validation looks good.');
       }
 
+      async function pollPmtaConfigInServer() {
+        const serverId = getCurrentSelectedServerId();
+        if (!serverId) return alert('Please select a Server, Domain, or IP linked to a server first');
+        const server = state.data.servers.find(x => x.id === serverId);
+        if (!server) return alert('Server not found');
+
+        const generated = generatePmtaForServer(serverId);
+        if (!generated) return alert('This server needs five valid IP/domain mappings before polling the full config into the server');
+
+        let sshSettings;
+        try {
+          sshSettings = validateSshSettings(getServerSshSettings(server));
+        } catch (error) {
+          return alert(error.message || 'SSH settings are incomplete');
+        }
+
+        renderGeneratedOutput(generated);
+        const confirmed = confirm(`This will replace the full file ${PMTA_REMOTE_CONFIG_PATH} on ${server.name}. Continue?`);
+        if (!confirmed) return;
+
+        const button = document.getElementById('pollPmtaInServerBtn');
+        const previousLabel = button?.textContent || 'Polling in Server';
+        if (button) {
+          button.disabled = true;
+          button.textContent = 'Polling...';
+        }
+
+        try {
+          const result = await apiPollPmtaConfig({
+            ...sshSettings,
+            configContent: generated,
+          });
+          server.pmtaConfigFingerprint = generated.trim();
+          server.pmtaConfigPolledAt = new Date().toISOString();
+          server.pmtaConfigRemotePath = result.remotePath || PMTA_REMOTE_CONFIG_PATH;
+          await saveData();
+          alert(result.message || `PowerMTA config was polled to ${server.name} successfully.`);
+        } catch (error) {
+          alert(error.message || 'Failed to poll PowerMTA config into the server');
+        } finally {
+          if (button) {
+            button.disabled = false;
+            button.textContent = previousLabel;
+          }
+        }
+      }
+
       function generatePmtaForDomain(domain) {
         const ip = state.data.ips.find(i => i.id === domain.ipId);
         if (!ip) return '';
@@ -3050,7 +3174,7 @@ HTML = r'''<!DOCTYPE html>
         return generateFullPmtaForServer(serverId);
       }
 
-      function generateFullPmtaForServer(serverId) {
+      function getPmtaGenerationBundle(serverId) {
         function labelRank(label) {
           const clean = String(label || '').toLowerCase().trim();
           if (clean.indexOf('main') >= 0) return 1;
@@ -3100,9 +3224,9 @@ HTML = r'''<!DOCTYPE html>
           };
         });
 
-        if (!mappings.length) return '';
-        if (mappings.some(item => !item.domain || !isValidDomain(item.domain))) return '';
-        if (mappings.length < 5) return '';
+        if (!mappings.length) return { output: '', mappings, reason: 'no-mappings' };
+        if (mappings.some(item => !item.domain || !isValidDomain(item.domain))) return { output: '', mappings, reason: 'invalid-domain' };
+        if (mappings.length < 5) return { output: '', mappings, reason: 'needs-five-ips' };
 
         const fallback = mappings[mappings.length - 1];
         let output = getStrictPmtaTemplate();
@@ -3129,7 +3253,11 @@ HTML = r'''<!DOCTYPE html>
           output = output.split(placeholder).join(String(value || ''));
         });
 
-        return output;
+        return { output, mappings, reason: '' };
+      }
+
+      function generateFullPmtaForServer(serverId) {
+        return getPmtaGenerationBundle(serverId).output || '';
       }
 
       function getStrictPmtaTemplate() {
@@ -4115,15 +4243,13 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
           if (domain) renderGeneratedOutput(generatePmtaForDomain(domain));
         });
         document.getElementById('generateServerPmtaBtn')?.addEventListener('click', () => {
-          let serverId = null;
-          if (state.selected.type === 'server') serverId = state.selected.id;
-          if (state.selected.type === 'ip') serverId = state.data.ips.find(x => x.id === state.selected.id)?.serverId || null;
-          if (state.selected.type === 'domain') serverId = state.data.domains.find(x => x.id === state.selected.id)?.serverId || null;
+          const serverId = getCurrentSelectedServerId();
           if (!serverId) return alert('Please select a Server, Domain, or IP linked to a server first');
           const generated = generatePmtaForServer(serverId);
           if (!generated) return alert('This server needs valid IPs and linked domains before generating the full config');
           renderGeneratedOutput(generated);
         });
+        document.getElementById('pollPmtaInServerBtn')?.addEventListener('click', pollPmtaConfigInServer);
 
         document.getElementById('mainTabs')?.addEventListener('click', (e) => {
           const tab = e.target.closest('.tab');
@@ -4467,6 +4593,15 @@ def api_generate_dkim():
     payload = request.get_json(silent=True) or {}
     try:
         return jsonify(run_dkim_generation(payload))
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+
+
+@app.route('/api/pmta/poll-config', methods=['POST'])
+def api_poll_pmta_config():
+    payload = request.get_json(silent=True) or {}
+    try:
+        return jsonify(run_pmta_config_polling(payload))
     except Exception as exc:
         return jsonify({'ok': False, 'error': str(exc)}), 400
 
