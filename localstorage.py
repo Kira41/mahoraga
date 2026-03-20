@@ -3,8 +3,11 @@ import posixpath
 import re
 import sqlite3
 import json
+import xml.etree.ElementTree as ET
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 import paramiko
 from cryptography.hazmat.primitives import serialization
@@ -18,6 +21,143 @@ REMOTE_BASE_DIR = '/root'
 PMTA_REMOTE_CONFIG_PATH = '/etc/pmta/config'
 DOMAIN_RE = re.compile(r'^(?=.{1,253}$)(?!-)([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$')
 SELECTOR_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$')
+
+
+class NamecheapAPIError(Exception):
+    pass
+
+
+class NamecheapClient:
+    PRODUCTION_URL = "https://api.namecheap.com/xml.response"
+    SANDBOX_URL = "https://api.sandbox.namecheap.com/xml.response"
+
+    def __init__(
+        self,
+        api_user: str,
+        api_key: str,
+        username: str,
+        client_ip: str,
+        sandbox: bool = False,
+        timeout: int = 30,
+    ):
+        self.api_user = api_user
+        self.api_key = api_key
+        self.username = username
+        self.client_ip = client_ip
+        self.timeout = timeout
+        self.base_url = self.SANDBOX_URL if sandbox else self.PRODUCTION_URL
+
+    def _base_params(self, command: str) -> Dict[str, str]:
+        return {
+            "ApiUser": self.api_user,
+            "ApiKey": self.api_key,
+            "UserName": self.username,
+            "ClientIp": self.client_ip,
+            "Command": command,
+        }
+
+    def _call(self, command: str, extra_params: Optional[Dict[str, str]] = None) -> ET.Element:
+        params = self._base_params(command)
+        if extra_params:
+            params.update(extra_params)
+
+        encoded = urllib.parse.urlencode(params).encode("utf-8")
+        request_obj = urllib.request.Request(
+            self.base_url,
+            data=encoded,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request_obj, timeout=self.timeout) as response:
+                response_text = response.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            raise NamecheapAPIError(f"Namecheap request failed: {exc}") from exc
+
+        try:
+            root = ET.fromstring(response_text)
+        except ET.ParseError as exc:
+            raise NamecheapAPIError(f"Invalid XML response: {exc}\nRaw response:\n{response_text}") from exc
+
+        if root.attrib.get("Status") != "OK":
+            errors = []
+            for err in root.findall(".//{*}Error"):
+                code = err.attrib.get("Number", "Unknown")
+                errors.append(f"[{code}] {err.text}")
+            if not errors:
+                errors.append("Unknown API error")
+            raise NamecheapAPIError(" | ".join(errors))
+
+        return root
+
+    @staticmethod
+    def split_domain(domain: str) -> Tuple[str, str]:
+        clean = (domain or "").strip().lower()
+        if "." not in clean:
+            raise ValueError("Invalid domain name")
+        return clean.rsplit(".", 1)
+
+    def list_domains(self, page: int = 1, page_size: int = 100, sort_by: str = "NAME") -> List[Dict[str, str]]:
+        root = self._call(
+            "namecheap.domains.getList",
+            {"Page": str(page), "PageSize": str(page_size), "SortBy": sort_by},
+        )
+
+        domains = []
+        for item in root.findall(".//{*}Domain"):
+            domains.append(
+                {
+                    "id": item.attrib.get("ID", ""),
+                    "name": item.attrib.get("Name", ""),
+                    "created": item.attrib.get("Created", ""),
+                    "expires": item.attrib.get("Expires", ""),
+                    "isExpired": item.attrib.get("IsExpired", ""),
+                    "isLocked": item.attrib.get("IsLocked", ""),
+                    "autoRenew": item.attrib.get("AutoRenew", ""),
+                    "whoisGuard": item.attrib.get("WhoisGuard", ""),
+                }
+            )
+        return domains
+
+    def list_dns_records(self, domain: str) -> List[Dict[str, str]]:
+        sld, tld = self.split_domain(domain)
+        root = self._call("namecheap.domains.dns.getHosts", {"SLD": sld, "TLD": tld})
+        records = []
+        for host in root.findall(".//{*}Host"):
+            records.append(
+                {
+                    "host_id": host.attrib.get("HostId", ""),
+                    "name": host.attrib.get("Name", ""),
+                    "type": host.attrib.get("Type", ""),
+                    "address": host.attrib.get("Address", ""),
+                    "mx_pref": host.attrib.get("MXPref", ""),
+                    "ttl": host.attrib.get("TTL", ""),
+                }
+            )
+        return records
+
+    def _set_hosts(self, domain: str, records: List[Dict[str, str]]) -> bool:
+        sld, tld = self.split_domain(domain)
+        params = {"SLD": sld, "TLD": tld}
+
+        for index, record in enumerate(records, start=1):
+            params[f"HostName{index}"] = record["name"]
+            params[f"RecordType{index}"] = record["type"]
+            params[f"Address{index}"] = record["address"]
+            if record.get("mx_pref") not in ("", None):
+                params[f"MXPref{index}"] = str(record["mx_pref"])
+            if record.get("ttl") not in ("", None):
+                params[f"TTL{index}"] = str(record["ttl"])
+
+        root = self._call("namecheap.domains.dns.setHosts", params)
+        result = root.find(".//{*}DomainDNSSetHostsResult")
+        return result is not None and result.attrib.get("IsSuccess", "").lower() == "true"
+
+    def ensure_namecheap_dns(self, domain: str) -> bool:
+        sld, tld = self.split_domain(domain)
+        root = self._call("namecheap.domains.dns.setDefault", {"SLD": sld, "TLD": tld})
+        result = root.find(".//{*}DomainDNSSetDefaultResult")
+        return result is not None and result.attrib.get("Updated", "").lower() == "true"
 
 
 def is_valid_domain_name(value: str) -> bool:
@@ -224,6 +364,148 @@ def run_pmta_config_polling(payload: dict):
                 client.close()
         except Exception:
             pass
+
+
+def normalize_namecheap_config(payload: dict) -> Dict[str, object]:
+    payload = payload or {}
+    return {
+        "token": str(payload.get("token") or "").strip(),
+        "username": str(payload.get("username") or "").strip(),
+        "password": str(payload.get("password") or ""),
+        "apiKey": str(payload.get("apiKey") or "").strip(),
+        "clientIp": str(payload.get("clientIp") or "").strip(),
+        "sandbox": bool(payload.get("sandbox")),
+        "lastDomains": payload.get("lastDomains") if isinstance(payload.get("lastDomains"), list) else [],
+        "lastCheckedAt": str(payload.get("lastCheckedAt") or "").strip(),
+    }
+
+
+def build_namecheap_client(payload: dict) -> NamecheapClient:
+    config = normalize_namecheap_config(payload)
+    if not config["token"]:
+        raise ValueError("Namecheap token / ApiUser is required.")
+    if not config["username"]:
+        raise ValueError("Namecheap username is required.")
+    if not config["apiKey"]:
+        raise ValueError("Namecheap API key is required.")
+    if not config["clientIp"]:
+        raise ValueError("Namecheap client IP is required.")
+    return NamecheapClient(
+        api_user=str(config["token"]),
+        api_key=str(config["apiKey"]),
+        username=str(config["username"]),
+        client_ip=str(config["clientIp"]),
+        sandbox=bool(config["sandbox"]),
+    )
+
+
+def extract_relative_host(fqdn: str, domain: str) -> str:
+    clean_fqdn = (fqdn or "").strip().lower().rstrip(".")
+    clean_domain = (domain or "").strip().lower().rstrip(".")
+    if not clean_fqdn or not clean_domain:
+        return ""
+    if clean_fqdn == clean_domain:
+        return "@"
+    suffix = f".{clean_domain}"
+    if clean_fqdn.endswith(suffix):
+        return clean_fqdn[: -len(suffix)] or "@"
+    return ""
+
+
+def upsert_namecheap_record(records: List[Dict[str, str]], new_record: Dict[str, str]):
+    new_type = (new_record.get("type") or "").upper()
+    new_name = (new_record.get("name") or "").strip().lower()
+    new_address = (new_record.get("address") or "").strip()
+
+    replaced = False
+    for record in records:
+        record_type = (record.get("type") or "").upper()
+        record_name = (record.get("name") or "").strip().lower()
+        if record_type != new_type or record_name != new_name:
+            continue
+        if new_type == "MX" and record.get("mx_pref") not in ("", None) and new_record.get("mx_pref") not in ("", None):
+            if str(record.get("mx_pref")) != str(new_record.get("mx_pref")):
+                continue
+        record["address"] = new_address
+        if "ttl" in new_record:
+            record["ttl"] = str(new_record.get("ttl") or "")
+        if "mx_pref" in new_record:
+            record["mx_pref"] = str(new_record.get("mx_pref") or "")
+        replaced = True
+        break
+
+    if not replaced:
+        records.append(
+            {
+                "name": new_record.get("name", ""),
+                "type": new_type,
+                "address": new_address,
+                "ttl": str(new_record.get("ttl") or ""),
+                "mx_pref": str(new_record.get("mx_pref") or ""),
+            }
+        )
+
+
+def build_required_namecheap_records(payload: dict) -> List[Dict[str, str]]:
+    domain = str(payload.get("domain") or "").strip().lower()
+    root_ip = str(payload.get("ipAddress") or "").strip()
+    helo = str(payload.get("helo") or "").strip().lower()
+    selector = str(payload.get("selector") or "dkim").strip() or "dkim"
+    public_key = str(payload.get("publicKey") or "").strip()
+    spf = str(payload.get("spf") or "").strip()
+    dmarc = str(payload.get("dmarc") or "").strip()
+    ttl = str(payload.get("ttl") or 1800)
+
+    if not domain:
+        raise ValueError("Domain is required for Namecheap polling.")
+    if not root_ip:
+        raise ValueError("A record IP is required for Namecheap polling.")
+    if not public_key:
+        raise ValueError("DKIM public key is required before polling Namecheap.")
+    if not spf:
+        raise ValueError("SPF value is required before polling Namecheap.")
+    if not dmarc:
+        raise ValueError("DMARC value is required before polling Namecheap.")
+
+    records = [
+        {"name": "@", "type": "A", "address": root_ip, "ttl": ttl},
+        {"name": "@", "type": "TXT", "address": spf, "ttl": ttl},
+        {"name": f"{selector}._domainkey", "type": "TXT", "address": f"v=DKIM1; k=rsa; p={public_key}", "ttl": ttl},
+        {"name": "_dmarc", "type": "TXT", "address": dmarc, "ttl": ttl},
+    ]
+
+    mx_target = helo or f"mail.{domain}"
+    records.append({"name": "@", "type": "MX", "address": mx_target, "mx_pref": "10", "ttl": ttl})
+
+    mail_host = extract_relative_host(mx_target, domain)
+    if mail_host:
+        records.append({"name": mail_host, "type": "A", "address": root_ip, "ttl": ttl})
+
+    return records
+
+
+def poll_namecheap_dns(payload: dict):
+    client = build_namecheap_client(payload.get("config") or {})
+    domain = str(payload.get("domain") or "").strip().lower()
+    if not domain:
+        raise ValueError("Domain is required.")
+
+    existing_records = client.list_dns_records(domain)
+    merged_records = list(existing_records)
+    required_records = build_required_namecheap_records(payload)
+    for record in required_records:
+        upsert_namecheap_record(merged_records, record)
+
+    success = client._set_hosts(domain, merged_records)
+    if not success:
+        raise NamecheapAPIError("Namecheap did not confirm DNS update success.")
+
+    return {
+        "ok": True,
+        "domain": domain,
+        "appliedRecords": required_records,
+        "message": f"Namecheap DNS records were updated for {domain}.",
+    }
 
 HTML = r'''<!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -652,7 +934,7 @@ HTML = r'''<!DOCTYPE html>
       <div class="actions">
         <button id="exportBtn">Export JSON</button>
         <button id="importBtn">Import JSON</button>
-        <button id="seedBtn">Load Sample Data</button>
+        <button id="namecheapConfigBtn">NameChip Config</button>
         <button id="domainsRegistryBtn">Domains</button>
         <button id="bulkDkimBtn" class="btn-danger">Bulk DKIM generator</button>
       </div>
@@ -887,6 +1169,63 @@ HTML = r'''<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="modal-overlay" id="namecheapOverlay">
+    <div class="modal">
+      <div class="modal-header">
+        <div>
+          <h3>NameChip Config</h3>
+          <p>Save the Namecheap account data locally, test the API connection, and load the domains available in that account.</p>
+        </div>
+        <button id="namecheapCloseBtn" class="modal-close">×</button>
+      </div>
+      <div class="modal-body">
+        <div id="namecheapNotice" class="notice">Enter your Namecheap account details, then click Try Connection.</div>
+        <div class="row" style="margin-top:14px;">
+          <div>
+            <label>Token / ApiUser</label>
+            <input id="namecheapToken" placeholder="Namecheap ApiUser / token" />
+          </div>
+          <div>
+            <label>Username</label>
+            <input id="namecheapUsername" placeholder="Namecheap username" />
+          </div>
+        </div>
+        <div class="row" style="margin-top:12px;">
+          <div>
+            <label>Password</label>
+            <input id="namecheapPassword" type="password" placeholder="Saved locally for account reference" />
+          </div>
+          <div>
+            <label>API Key</label>
+            <input id="namecheapApiKey" placeholder="Namecheap API key" />
+          </div>
+        </div>
+        <div class="row" style="margin-top:12px;">
+          <div>
+            <label>Client IP</label>
+            <input id="namecheapClientIp" placeholder="Whitelisted IPv4" />
+          </div>
+          <div>
+            <label>Environment</label>
+            <select id="namecheapSandbox">
+              <option value="false">Production</option>
+              <option value="true">Sandbox</option>
+            </select>
+          </div>
+        </div>
+        <div style="margin-top:16px;">
+          <h4 style="margin-bottom:8px;">Available Domains</h4>
+          <div id="namecheapDomainsList" class="notice">Run Try Connection to load domains from the account.</div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="namecheapTryBtn">Try Connection</button>
+        <button id="namecheapSaveBtn" class="btn-primary">Save</button>
+        <button id="namecheapCloseFooterBtn">Close</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     document.addEventListener('DOMContentLoaded', async () => {
       const STORAGE_KEY = 'mailInfraDashboardDataV4';
@@ -905,6 +1244,7 @@ HTML = r'''<!DOCTYPE html>
         registryPageSize: 5,
         modalMode: null,
         bulkDkimResults: null,
+        namecheapDomains: [],
       };
 
       async function apiGetData() {
@@ -962,6 +1302,28 @@ HTML = r'''<!DOCTYPE html>
         return data;
       }
 
+      async function apiTryNamecheapConnection(payload) {
+        const response = await fetch('/api/namecheap/test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Namecheap connection failed');
+        return data;
+      }
+
+      async function apiPollNamecheapDomain(payload) {
+        const response = await fetch('/api/namecheap/poll-domain', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Namecheap DNS polling failed');
+        return data;
+      }
+
       function uid(prefix = 'id') {
         return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
       }
@@ -974,6 +1336,16 @@ HTML = r'''<!DOCTYPE html>
           domainRegistry: [],
           snapshots: [],
           domainDraftsByIp: {},
+          namecheapConfig: {
+            token: '',
+            username: '',
+            password: '',
+            apiKey: '',
+            clientIp: '',
+            sandbox: false,
+            lastDomains: [],
+            lastCheckedAt: '',
+          },
         };
       }
 
@@ -992,6 +1364,9 @@ HTML = r'''<!DOCTYPE html>
           domainRegistry: safeArray(parsed.domainRegistry),
           snapshots: safeArray(parsed.snapshots),
           domainDraftsByIp: parsed.domainDraftsByIp && typeof parsed.domainDraftsByIp === 'object' ? parsed.domainDraftsByIp : {},
+          namecheapConfig: parsed.namecheapConfig && typeof parsed.namecheapConfig === 'object'
+            ? { ...defaultData().namecheapConfig, ...parsed.namecheapConfig }
+            : defaultData().namecheapConfig,
         };
       }
 
@@ -1189,6 +1564,111 @@ HTML = r'''<!DOCTYPE html>
         if (!notice) return;
         notice.className = type === 'ok' ? 'notice ok' : type === 'warn' ? 'notice warn' : type === 'err' ? 'notice err' : 'notice';
         notice.textContent = message;
+      }
+
+      function setNamecheapNotice(message, type = 'default') {
+        const notice = document.getElementById('namecheapNotice');
+        if (!notice) return;
+        notice.className = type === 'ok' ? 'notice ok' : type === 'warn' ? 'notice warn' : type === 'err' ? 'notice err' : 'notice';
+        notice.textContent = message;
+      }
+
+      function getNamecheapConfig() {
+        return { ...defaultData().namecheapConfig, ...(state.data.namecheapConfig || {}) };
+      }
+
+      function renderNamecheapDomains(domains = []) {
+        const list = document.getElementById('namecheapDomainsList');
+        if (!list) return;
+        if (!domains.length) {
+          list.className = 'notice';
+          list.textContent = 'No domains loaded yet.';
+          return;
+        }
+        list.className = 'pre-box';
+        list.innerHTML = domains.map(domain => {
+          const name = escapeHtml(domain.name || '');
+          const expires = escapeHtml(domain.expires || '-');
+          return `<div style="padding:4px 0;"><strong>${name}</strong> <span class="muted">· expires ${expires}</span></div>`;
+        }).join('');
+      }
+
+      function fillNamecheapModal() {
+        const config = getNamecheapConfig();
+        const domains = Array.isArray(config.lastDomains) ? config.lastDomains : [];
+        const token = document.getElementById('namecheapToken');
+        const username = document.getElementById('namecheapUsername');
+        const password = document.getElementById('namecheapPassword');
+        const apiKey = document.getElementById('namecheapApiKey');
+        const clientIp = document.getElementById('namecheapClientIp');
+        const sandbox = document.getElementById('namecheapSandbox');
+        if (token) token.value = config.token || '';
+        if (username) username.value = config.username || '';
+        if (password) password.value = config.password || '';
+        if (apiKey) apiKey.value = config.apiKey || '';
+        if (clientIp) clientIp.value = config.clientIp || '';
+        if (sandbox) sandbox.value = config.sandbox ? 'true' : 'false';
+        renderNamecheapDomains(domains);
+        state.namecheapDomains = domains;
+      }
+
+      function collectNamecheapConfigFromModal() {
+        return {
+          token: document.getElementById('namecheapToken')?.value.trim() || '',
+          username: document.getElementById('namecheapUsername')?.value.trim() || '',
+          password: document.getElementById('namecheapPassword')?.value || '',
+          apiKey: document.getElementById('namecheapApiKey')?.value.trim() || '',
+          clientIp: document.getElementById('namecheapClientIp')?.value.trim() || '',
+          sandbox: document.getElementById('namecheapSandbox')?.value === 'true',
+          lastDomains: state.namecheapDomains || [],
+          lastCheckedAt: new Date().toISOString(),
+        };
+      }
+
+      function validateNamecheapConfig(config) {
+        if (!config.token) throw new Error('Please enter the Namecheap token / ApiUser');
+        if (!config.username) throw new Error('Please enter the Namecheap username');
+        if (!config.apiKey) throw new Error('Please enter the Namecheap API key');
+        if (!config.clientIp) throw new Error('Please enter the whitelisted Namecheap client IP');
+        return config;
+      }
+
+      function openNamecheapModal() {
+        document.getElementById('namecheapOverlay')?.classList.add('show');
+        fillNamecheapModal();
+        const config = getNamecheapConfig();
+        setNamecheapNotice(
+          config.lastCheckedAt
+            ? `Last checked at ${config.lastCheckedAt}. Run Try Connection again to refresh available domains.`
+            : 'Enter your Namecheap account details, then click Try Connection.',
+          config.lastCheckedAt ? 'ok' : 'default'
+        );
+      }
+
+      function closeNamecheapModal() {
+        document.getElementById('namecheapOverlay')?.classList.remove('show');
+      }
+
+      async function saveNamecheapConfig() {
+        const config = validateNamecheapConfig(collectNamecheapConfigFromModal());
+        state.data.namecheapConfig = config;
+        await saveData();
+        setNamecheapNotice('Namecheap configuration saved locally.', 'ok');
+      }
+
+      async function tryNamecheapConnection() {
+        const config = validateNamecheapConfig(collectNamecheapConfigFromModal());
+        setNamecheapNotice('Trying Namecheap connection...', 'warn');
+        const result = await apiTryNamecheapConnection(config);
+        state.namecheapDomains = result.domains || [];
+        state.data.namecheapConfig = {
+          ...config,
+          lastDomains: state.namecheapDomains,
+          lastCheckedAt: new Date().toISOString(),
+        };
+        renderNamecheapDomains(state.namecheapDomains);
+        await saveData();
+        setNamecheapNotice(result.message || `Loaded ${state.namecheapDomains.length} domains from Namecheap.`, 'ok');
       }
 
       function closeBulkDkimModal() {
@@ -1422,6 +1902,9 @@ HTML = r'''<!DOCTYPE html>
           domainRegistry: safeArray(parsed.domainRegistry),
           snapshots: safeArray(parsed.snapshots),
           domainDraftsByIp: parsed.domainDraftsByIp && typeof parsed.domainDraftsByIp === 'object' ? parsed.domainDraftsByIp : {},
+          namecheapConfig: parsed.namecheapConfig && typeof parsed.namecheapConfig === 'object'
+            ? { ...defaultData().namecheapConfig, ...parsed.namecheapConfig }
+            : defaultData().namecheapConfig,
         };
       }
 
@@ -1515,6 +1998,10 @@ HTML = r'''<!DOCTYPE html>
             current.domainDraftsByIp[ipId] = draft;
           }
         });
+
+        if (!current.namecheapConfig?.token && imported.namecheapConfig?.token) {
+          current.namecheapConfig = { ...defaultData().namecheapConfig, ...imported.namecheapConfig };
+        }
 
         return current;
       }
@@ -2043,7 +2530,7 @@ HTML = r'''<!DOCTYPE html>
         const effectiveIp = domain ? state.data.ips.find(ip => ip.id === domain.ipId) || null : preferredIp;
         return `
           ${buildWorkspaceNav('domain', effectiveServer)}
-          <div class="notice">This domain workspace is scoped automatically from the infrastructure tree. DKIM now generates automatically from PTR using the selected server SSH settings, and you can regenerate it here if needed.</div>
+          <div class="notice">This domain workspace is scoped automatically from the infrastructure tree. DKIM now generates automatically from PTR using the selected server SSH settings, and you can regenerate it here if needed. Use Polling NameChip to sync A, MX, SPF, DKIM, and DMARC records into Namecheap.</div>
           <div class="divider"></div>
           <div class="small muted">Context: ${escapeHtml(effectiveServer?.name || 'No server')} → ${escapeHtml(effectiveIp?.ip || 'No IP selected')} → Domain Workspace</div>
           <input id="domainServerSelect" type="hidden" value="${escapeHtml(effectiveServer?.id || '')}" />
@@ -2100,6 +2587,7 @@ HTML = r'''<!DOCTYPE html>
           </div>
           <div class="inline-actions" style="margin-top:12px;">
             <button id="generateDomainDkimBtn" type="button">Generate DKIM From PTR Domain</button>
+            <button id="pollNamecheapBtn" type="button" class="btn-warning">Polling NameChip</button>
           </div>
           <div style="margin-top:12px;">
             <button id="addDomainBtn" class="btn-primary">${domain ? 'Save Domain' : 'Add Domain'}</button>
@@ -2983,6 +3471,65 @@ HTML = r'''<!DOCTYPE html>
           alert(`DKIM generated successfully for ${domain}`);
         } catch (error) {
           alert(error.message || 'Failed to generate DKIM');
+        }
+      }
+
+      async function pollCurrentDomainToNamecheap() {
+        const config = getNamecheapConfig();
+        if (!config.token || !config.username || !config.apiKey || !config.clientIp) {
+          alert('Please save Namecheap configuration first from the NameChip Config popup.');
+          openNamecheapModal();
+          return;
+        }
+
+        const domain = normalizeDomain(document.getElementById('domainName')?.value || '');
+        const helo = document.getElementById('domainHelo')?.value.trim() || '';
+        const selector = document.getElementById('domainSelector')?.value.trim() || 'dkim';
+        const spf = document.getElementById('domainSpf')?.value.trim() || '';
+        const dmarc = document.getElementById('domainDmarc')?.value.trim() || '';
+        const publicKey = document.getElementById('domainPublicKey')?.value.trim() || '';
+        const ipId = document.getElementById('domainIpSelect')?.value || '';
+        const ipRecord = state.data.ips.find(ip => ip.id === ipId);
+        if (!ipRecord?.ip) return alert('This domain is missing a linked IP address.');
+
+        const confirmed = confirm(`This will upsert A, MX, SPF, DKIM, and DMARC records for ${domain} in Namecheap. Continue?`);
+        if (!confirmed) return;
+
+        const button = document.getElementById('pollNamecheapBtn');
+        const previousLabel = button?.textContent || 'Polling NameChip';
+        if (button) {
+          button.disabled = true;
+          button.textContent = 'Polling...';
+        }
+
+        try {
+          const result = await apiPollNamecheapDomain({
+            config,
+            domain,
+            ipAddress: ipRecord.ip,
+            helo,
+            selector,
+            spf,
+            dmarc,
+            publicKey,
+            ttl: 1800,
+          });
+          const editingDomain = state.selected.type === 'domain'
+            ? state.data.domains.find(x => x.id === state.selected.id) || null
+            : null;
+          if (editingDomain) {
+            editingDomain.namecheapLastPolledAt = new Date().toISOString();
+            editingDomain.namecheapLastAppliedRecords = result.appliedRecords || [];
+          }
+          await saveData();
+          alert(result.message || `Namecheap DNS records were updated for ${domain}.`);
+        } catch (error) {
+          alert(error.message || 'Failed to poll Namecheap DNS records');
+        } finally {
+          if (button) {
+            button.disabled = false;
+            button.textContent = previousLabel;
+          }
         }
       }
 
@@ -3936,57 +4483,6 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
         alert('All database data has been removed');
       }
 
-      async function seedData() {
-        if (state.data.servers.length || state.data.ips.length || state.data.domains.length) {
-          const ok = confirm('There is already data stored. Do you want to replace it with sample data?');
-          if (!ok) return;
-        }
-        state.data = defaultData();
-        const srvId = uid('srv');
-        const ipIds = [uid('ip'), uid('ip'), uid('ip'), uid('ip'), uid('ip')];
-        state.data.servers.push({ id: srvId, name: 'srv-mpp-01', provider: 'Example DC', expiryDate: '', accountUser: 'admin@example.com', notes: 'Seed server', createdAt: Date.now() });
-        const seedIps = [
-          ['194.116.172.135','ip-mail-01','mail.llavedecobre.com','mail.llavedecobre.com'],
-          ['194.116.172.136','ip-mail-02','mail.brasaf-sa.com','mail.brasaf-sa.com'],
-          ['194.116.172.137','ip-mail-03','mail.vilabeerrestaurante.com.br','mail.vilabeerrestaurante.com.br'],
-          ['194.116.172.138','ip-mail-04','mail.golddrive-in.com.br','mail.golddrive-in.com.br'],
-          ['194.116.172.139','ip-mail-05','s5.mediapaypro.work','s5.mediapaypro.work'],
-        ];
-        seedIps.forEach((x, idx) => {
-          const ipRecord = { id: ipIds[idx], serverId: srvId, ip: x[0], label: x[1], ptr: x[2], helo: x[3], extractedDomain: extractDomainFromPtr(x[2]), createdAt: Date.now() };
-          state.data.ips.push(ipRecord);
-        });
-        const seedDomains = [
-          ['llavedecobre.com', ipIds[0], 'pmta-llavedecobre', 'mail.llavedecobre.com'],
-          ['brasaf-sa.com', ipIds[1], 'pmta-brasaf-sa', 'mail.brasaf-sa.com'],
-          ['vilabeerrestaurante.com.br', ipIds[2], 'pmta-vilabeerrestaurante-com', 'mail.vilabeerrestaurante.com.br'],
-          ['golddrive-in.com.br', ipIds[3], 'pmta-golddrive-in-com', 'mail.golddrive-in.com.br'],
-          ['mediapaypro.work', ipIds[4], 'pmta-mediapaypro', 's5.mediapaypro.work'],
-        ];
-        seedDomains.forEach(([domain, ipId, vmta, helo], idx) => {
-          const ip = seedIps[idx][0];
-          state.data.domains.push({
-            id: uid('dom'),
-            serverId: srvId,
-            ipId,
-            domain,
-            vmta,
-            helo,
-            selector: 'dkim',
-            pemPath: `/root/${domain}/dkim.pem`,
-            dmarc: `v=DMARC1; p=none; rua=mailto:dmarc@${domain}`,
-            spf: `v=spf1 ip4:${ip} ~all`,
-            ptr: helo,
-            publicKey: '',
-            createdAt: Date.now()
-          });
-        });
-        state.selected = { type: 'server', id: srvId };
-        state.showWorkspace = true;
-        state.workspaceMode = 'auto';
-        await saveData();
-      }
-
       function renderPmtaServerSelect() {
         const select = document.getElementById('pmtaServerSelect');
         if (!select) return;
@@ -4104,13 +4600,13 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
         document.getElementById('exportBtn')?.addEventListener('click', exportData);
         document.getElementById('importBtn')?.addEventListener('click', () => openJsonModal('import', ''));
         document.getElementById('bulkDkimBtn')?.addEventListener('click', openBulkDkimModal);
+        document.getElementById('namecheapConfigBtn')?.addEventListener('click', openNamecheapModal);
         document.getElementById('domainsRegistryBtn')?.addEventListener('click', () => {
           document.querySelectorAll('#mainTabs .tab').forEach(t => t.classList.remove('active'));
           document.getElementById('domainsRegistryTab')?.classList.add('active');
           document.querySelectorAll('.tab-panel').forEach(panel => panel.classList.remove('active'));
           document.getElementById('domainsRegistryPanel')?.classList.add('active');
         });
-        document.getElementById('seedBtn')?.addEventListener('click', seedData);
         document.getElementById('treeExpandBtn')?.addEventListener('click', () => {
           state.treeCollapsed = false;
           state.data.servers.forEach(server => {
@@ -4152,6 +4648,7 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
           if (e.target.id === 'addDomainBtn') await addDomain();
           if (e.target.id === 'serverCheckSshBtn') await checkServerSshFromWorkspace();
           if (e.target.id === 'generateDomainDkimBtn') await regenerateCurrentDomainDkim();
+          if (e.target.id === 'pollNamecheapBtn') await pollCurrentDomainToNamecheap();
 
           if (e.target.id === 'openServerWorkspaceBtn') {
             state.workspaceMode = 'auto';
@@ -4270,8 +4767,28 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
             closeBulkDkimModal();
             return;
           }
+          if (e.target.id === 'namecheapCloseBtn' || e.target.id === 'namecheapCloseFooterBtn' || e.target.id === 'namecheapOverlay') {
+            closeNamecheapModal();
+            return;
+          }
           if (e.target.id === 'copyJsonBtn') {
             copyJsonToClipboard();
+            return;
+          }
+          if (e.target.id === 'namecheapTryBtn') {
+            try {
+              await tryNamecheapConnection();
+            } catch (error) {
+              setNamecheapNotice(error.message || 'Namecheap connection failed.', 'err');
+            }
+            return;
+          }
+          if (e.target.id === 'namecheapSaveBtn') {
+            try {
+              await saveNamecheapConfig();
+            } catch (error) {
+              setNamecheapNotice(error.message || 'Failed to save Namecheap config.', 'err');
+            }
             return;
           }
           if (e.target.dataset.copyTarget) {
@@ -4381,6 +4898,9 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
           if (e.key === 'Escape' && document.getElementById('bulkDkimOverlay')?.classList.contains('show')) {
             closeBulkDkimModal();
           }
+          if (e.key === 'Escape' && document.getElementById('namecheapOverlay')?.classList.contains('show')) {
+            closeNamecheapModal();
+          }
         });
       }
 
@@ -4429,6 +4949,7 @@ def default_data():
         "domainRegistry": [],
         "snapshots": [],
         "domainDraftsByIp": {},
+        "namecheapConfig": normalize_namecheap_config({}),
     }
 
 
@@ -4486,6 +5007,8 @@ def normalize_data(data):
         normalized['domainDraftsByIp'] = {}
     elif not isinstance(drafts, dict):
         raise ValueError("Field 'domainDraftsByIp' must be an object")
+
+    normalized['namecheapConfig'] = normalize_namecheap_config(normalized.get('namecheapConfig') or {})
 
     return normalized
 
@@ -4602,6 +5125,32 @@ def api_poll_pmta_config():
     payload = request.get_json(silent=True) or {}
     try:
         return jsonify(run_pmta_config_polling(payload))
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+
+
+@app.route('/api/namecheap/test', methods=['POST'])
+def api_namecheap_test():
+    payload = request.get_json(silent=True) or {}
+    try:
+        client = build_namecheap_client(payload)
+        domains = client.list_domains(page=1, page_size=100)
+        return jsonify(
+            {
+                'ok': True,
+                'domains': domains,
+                'message': f'Connected to Namecheap successfully. Loaded {len(domains)} domains.',
+            }
+        )
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+
+
+@app.route('/api/namecheap/poll-domain', methods=['POST'])
+def api_namecheap_poll_domain():
+    payload = request.get_json(silent=True) or {}
+    try:
+        return jsonify(poll_namecheap_dns(payload))
     except Exception as exc:
         return jsonify({'ok': False, 'error': str(exc)}), 400
 
