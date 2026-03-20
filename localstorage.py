@@ -1233,9 +1233,9 @@ HTML = r'''<!DOCTYPE html>
         <div class="sub">A structured view of the selected server, IP, or domain, with hierarchy, readiness, and the most important operational details.</div>
         <div class="overview-grid">
           <div class="overview-stack">
-            <div id="overviewHero" class="mini-card">
-              <h4>Selection Summary</h4>
-              <div class="muted-box">Select a server, IP, or domain from the infrastructure tree to populate this overview.</div>
+            <div id="overviewConfig" class="mini-card">
+              <h4>Config Snapshot</h4>
+              <div class="muted-box">Core sending configuration will appear here.</div>
             </div>
             <div id="overviewHierarchy" class="mini-card">
               <h4>Hierarchy</h4>
@@ -1251,9 +1251,9 @@ HTML = r'''<!DOCTYPE html>
               <h4>Health & Readiness</h4>
               <div class="muted-box">Readiness and quick checks will appear here.</div>
             </div>
-            <div id="overviewConfig" class="mini-card">
-              <h4>Config Snapshot</h4>
-              <div class="muted-box">Core sending configuration will appear here.</div>
+            <div id="overviewHero" class="mini-card">
+              <h4>Selection Summary</h4>
+              <div class="muted-box">Select a server, IP, or domain from the infrastructure tree to populate this overview.</div>
             </div>
           </div>
         </div>
@@ -5202,6 +5202,7 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
           if (e.target.id === 'addDomainBtn') await addDomain();
           if (e.target.id === 'serverCheckSshBtn') await checkServerSshFromWorkspace();
           if (e.target.id === 'generateDomainDkimBtn') await regenerateCurrentDomainDkim();
+          if (e.target.id === 'verifyDomainHealthBtn') await verifyCurrentDomainHealth();
           if (e.target.id === 'pollNamecheapBtn') await pollCurrentDomainToNamecheap();
 
           if (e.target.id === 'openServerWorkspaceBtn') {
