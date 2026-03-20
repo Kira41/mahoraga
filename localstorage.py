@@ -464,6 +464,8 @@ def build_required_namecheap_records(payload: dict) -> List[Dict[str, str]]:
     domain = str(payload.get("domain") or "").strip().lower()
     root_ip = str(payload.get("ipAddress") or "").strip()
     helo = str(payload.get("helo") or "").strip().lower()
+    mx_target = str(payload.get("mxTarget") or payload.get("mxHost") or "").strip().lower()
+    mx_pref = str(payload.get("mxPref") or payload.get("mxPriority") or "10").strip() or "10"
     selector = str(payload.get("selector") or "dkim").strip() or "dkim"
     public_key = str(payload.get("publicKey") or "").strip()
     spf = str(payload.get("spf") or "").strip()
@@ -488,8 +490,8 @@ def build_required_namecheap_records(payload: dict) -> List[Dict[str, str]]:
         {"name": "_dmarc", "type": "TXT", "address": dmarc, "ttl": ttl},
     ]
 
-    mx_target = helo or f"mail.{domain}"
-    records.append({"name": "@", "type": "MX", "address": mx_target, "mx_pref": "10", "ttl": ttl})
+    mx_target = mx_target or helo or f"mail.{domain}"
+    records.append({"name": "@", "type": "MX", "address": mx_target, "mx_pref": mx_pref, "ttl": ttl})
 
     mail_host = extract_relative_host(mx_target, domain)
     if mail_host:

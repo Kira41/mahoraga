@@ -1,7 +1,12 @@
 import unittest
 import xml.etree.ElementTree as ET
 
-from localstorage import NamecheapClient, build_domain_verification
+from localstorage import (
+    NamecheapClient,
+    build_domain_verification,
+    build_required_namecheap_records,
+    poll_namecheap_dns,
+)
 
 
 class NamecheapXmlParsingTests(unittest.TestCase):
@@ -93,6 +98,72 @@ class DomainVerificationTests(unittest.TestCase):
         self.assertEqual("ok", result["overallStatus"])
         self.assertEqual(6, result["snapshot"]["count"])
         self.assertTrue(all(check["status"] == "ok" for check in result["checks"]))
+
+
+class NamecheapPollingTests(unittest.TestCase):
+    def test_build_required_namecheap_records_includes_mx_record(self):
+        records = build_required_namecheap_records(
+            {
+                "domain": "countrywater.online",
+                "ipAddress": "217.154.172.143",
+                "selector": "dkim",
+                "publicKey": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A",
+                "spf": "v=spf1 ip4:217.154.172.143 ~all",
+                "dmarc": "v=DMARC1; p=none; rua=mailto:dmarc@countrywater.online",
+                "ttl": 1800,
+            }
+        )
+
+        self.assertIn(
+            {"name": "@", "type": "MX", "address": "mail.countrywater.online", "mx_pref": "10", "ttl": "1800"},
+            records,
+        )
+
+    def test_poll_namecheap_dns_sends_mx_record_to_namecheap(self):
+        original_builder = poll_namecheap_dns.__globals__["build_namecheap_client"]
+        captured = {}
+        testcase = self
+
+        class StubClient:
+            def list_dns_records(self, requested_domain):
+                testcase.assertEqual("countrywater.online", requested_domain)
+                return [
+                    {"name": "@", "type": "A", "address": "203.0.113.10", "mx_pref": "", "ttl": "1800"},
+                ]
+
+            def _set_hosts(self, domain, records):
+                captured["domain"] = domain
+                captured["records"] = records
+                return True
+
+        poll_namecheap_dns.__globals__["build_namecheap_client"] = lambda _config: StubClient()
+        try:
+            result = poll_namecheap_dns(
+                {
+                    "config": {},
+                    "domain": "countrywater.online",
+                    "ipAddress": "217.154.172.143",
+                    "selector": "dkim",
+                    "publicKey": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A",
+                    "spf": "v=spf1 ip4:217.154.172.143 ~all",
+                    "dmarc": "v=DMARC1; p=none; rua=mailto:dmarc@countrywater.online",
+                    "ttl": 1800,
+                }
+            )
+        finally:
+            poll_namecheap_dns.__globals__["build_namecheap_client"] = original_builder
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("countrywater.online", captured["domain"])
+        self.assertTrue(
+            any(
+                record["name"] == "@"
+                and record["type"] == "MX"
+                and record["address"] == "mail.countrywater.online"
+                and record["mx_pref"] == "10"
+                for record in captured["records"]
+            )
+        )
 
 
 if __name__ == "__main__":
