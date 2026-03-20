@@ -28,6 +28,19 @@ class NamecheapAPIError(Exception):
     pass
 
 
+def xml_local_name(tag: str) -> str:
+    return str(tag or "").rsplit("}", 1)[-1].lower()
+
+
+def iter_xml_elements(root: ET.Element, local_name: str):
+    expected = str(local_name or "").strip().lower()
+    if not expected:
+        return
+    for element in root.iter():
+        if xml_local_name(element.tag) == expected:
+            yield element
+
+
 class NamecheapClient:
     PRODUCTION_URL = "https://api.namecheap.com/xml.response"
     SANDBOX_URL = "https://api.sandbox.namecheap.com/xml.response"
@@ -82,7 +95,7 @@ class NamecheapClient:
 
         if root.attrib.get("Status") != "OK":
             errors = []
-            for err in root.findall(".//{*}Error"):
+            for err in iter_xml_elements(root, "Error"):
                 code = err.attrib.get("Number", "Unknown")
                 errors.append(f"[{code}] {err.text}")
             if not errors:
@@ -105,7 +118,7 @@ class NamecheapClient:
         )
 
         domains = []
-        for item in root.findall(".//{*}Domain"):
+        for item in iter_xml_elements(root, "Domain"):
             domains.append(
                 {
                     "id": item.attrib.get("ID", ""),
@@ -124,7 +137,7 @@ class NamecheapClient:
         sld, tld = self.split_domain(domain)
         root = self._call("namecheap.domains.dns.getHosts", {"SLD": sld, "TLD": tld})
         records = []
-        for host in root.findall(".//{*}Host"):
+        for host in iter_xml_elements(root, "Host"):
             records.append(
                 {
                     "host_id": host.attrib.get("HostId", ""),
