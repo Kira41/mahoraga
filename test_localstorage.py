@@ -35,6 +35,73 @@ class NamecheapXmlParsingTests(unittest.TestCase):
         self.assertEqual("TXT", records[1]["type"])
 
 
+class NamecheapSetHostsTests(unittest.TestCase):
+    def test_set_hosts_sends_email_type_when_mx_records_are_present(self):
+        captured = {}
+        client = NamecheapClient("api-user", "api-key", "username", "127.0.0.1")
+
+        def stub_call(command, extra_params=None):
+            captured["command"] = command
+            captured["params"] = extra_params or {}
+            return ET.fromstring(
+                """
+                <ApiResponse Status="OK">
+                  <CommandResponse Type="namecheap.domains.dns.setHosts">
+                    <DomainDNSSetHostsResult Domain="countrywater.online" IsSuccess="true" />
+                  </CommandResponse>
+                </ApiResponse>
+                """
+            )
+
+        client._call = stub_call  # type: ignore[method-assign]
+
+        ok = client._set_hosts(
+            "countrywater.online",
+            [
+                {"name": "@", "type": "A", "address": "217.154.172.143", "ttl": "1800"},
+                {"name": "@", "type": "mx", "address": "mail.countrywater.online", "mx_pref": "10", "ttl": "1800"},
+            ],
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual("namecheap.domains.dns.setHosts", captured["command"])
+        self.assertEqual("MX", captured["params"]["EmailType"])
+        self.assertEqual("A", captured["params"]["RecordType1"])
+        self.assertEqual("MX", captured["params"]["RecordType2"])
+        self.assertEqual("10", captured["params"]["MXPref2"])
+
+    def test_set_hosts_omits_email_type_without_mx_records(self):
+        captured = {}
+        client = NamecheapClient("api-user", "api-key", "username", "127.0.0.1")
+
+        def stub_call(command, extra_params=None):
+            captured["command"] = command
+            captured["params"] = extra_params or {}
+            return ET.fromstring(
+                """
+                <ApiResponse Status="OK">
+                  <CommandResponse Type="namecheap.domains.dns.setHosts">
+                    <DomainDNSSetHostsResult Domain="countrywater.online" IsSuccess="true" />
+                  </CommandResponse>
+                </ApiResponse>
+                """
+            )
+
+        client._call = stub_call  # type: ignore[method-assign]
+
+        ok = client._set_hosts(
+            "countrywater.online",
+            [
+                {"name": "@", "type": "A", "address": "217.154.172.143", "ttl": "1800"},
+                {"name": "@", "type": "TXT", "address": "v=spf1 ip4:217.154.172.143 ~all", "ttl": "1800"},
+            ],
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual("namecheap.domains.dns.setHosts", captured["command"])
+        self.assertNotIn("EmailType", captured["params"])
+
+
 class NamecheapRecordUpsertTests(unittest.TestCase):
     def test_upsert_namecheap_record_replaces_duplicate_matching_records(self):
         records = [
