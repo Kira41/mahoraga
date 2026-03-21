@@ -153,15 +153,22 @@ class NamecheapClient:
     def _set_hosts(self, domain: str, records: List[Dict[str, str]]) -> bool:
         sld, tld = self.split_domain(domain)
         params = {"SLD": sld, "TLD": tld}
+        has_mx_record = False
 
         for index, record in enumerate(records, start=1):
+            record_type = str(record.get("type") or "").upper()
             params[f"HostName{index}"] = record["name"]
-            params[f"RecordType{index}"] = record["type"]
+            params[f"RecordType{index}"] = record_type
             params[f"Address{index}"] = record["address"]
+            if record_type == "MX":
+                has_mx_record = True
             if record.get("mx_pref") not in ("", None):
                 params[f"MXPref{index}"] = str(record["mx_pref"])
             if record.get("ttl") not in ("", None):
                 params[f"TTL{index}"] = str(record["ttl"])
+
+        if has_mx_record:
+            params["EmailType"] = "MX"
 
         root = self._call("namecheap.domains.dns.setHosts", params)
         result = root.find(".//{*}DomainDNSSetHostsResult")
