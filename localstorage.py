@@ -4311,7 +4311,7 @@ HTML = r'''<!DOCTYPE html>
         }
 
         function escapeDomainForPmtaRegex(domain) {
-          return String(domain || '').replace(/\./g, '\\\\.');
+          return String(domain || '').replace(/\./g, '\\.');
         }
 
         const sortedIps = state.data.ips
