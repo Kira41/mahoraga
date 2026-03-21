@@ -389,6 +389,11 @@ def run_pmta_config_polling(payload: dict):
 
 def normalize_namecheap_config(payload: dict) -> Dict[str, object]:
     payload = payload or {}
+    monitored_domains = payload.get("monitoredDomains")
+    if isinstance(monitored_domains, list):
+        monitored_domains = [str(item or "").strip().lower() for item in monitored_domains if str(item or "").strip()]
+    else:
+        monitored_domains = []
     return {
         "token": str(payload.get("token") or "").strip(),
         "username": str(payload.get("username") or "").strip(),
@@ -396,6 +401,7 @@ def normalize_namecheap_config(payload: dict) -> Dict[str, object]:
         "apiKey": str(payload.get("apiKey") or "").strip(),
         "clientIp": str(payload.get("clientIp") or "").strip(),
         "sandbox": bool(payload.get("sandbox")),
+        "monitoredDomains": list(dict.fromkeys(monitored_domains)),
         "lastDomains": payload.get("lastDomains") if isinstance(payload.get("lastDomains"), list) else [],
         "lastCheckedAt": str(payload.get("lastCheckedAt") or "").strip(),
     }
@@ -817,6 +823,18 @@ HTML = r'''<!DOCTYPE html>
     .btn-success { background: var(--success); color: #07150f; border-color: transparent; font-weight: bold; }
     .btn-warning { background: var(--warning); color: #201400; border-color: transparent; font-weight: bold; }
     .btn-danger { background: var(--danger); color: #240909; border-color: transparent; font-weight: bold; }
+    .btn-pill {
+      border-radius: 999px;
+      padding: 8px 14px;
+      min-height: 38px;
+      background: rgba(14, 22, 38, .96);
+      box-shadow: none;
+    }
+    .btn-pill.active {
+      background: rgba(88,166,255,.18);
+      border-color: rgba(88,166,255,.65);
+      color: #fff;
+    }
 
     .grid { display: grid; gap: 16px; }
     .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -1231,6 +1249,33 @@ HTML = r'''<!DOCTYPE html>
       font-size: 12px;
       line-height: 1.35;
     }
+    .namecheap-toolbar {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      margin: 14px 0 10px;
+    }
+    .namecheap-toolbar-label {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .namecheap-filter-chips {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .namecheap-domain-monitor {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+    }
+    .namecheap-domain-monitor .muted {
+      font-size: 12px;
+    }
 
     @media (max-width: 1200px) {
       .grid-4, .row, .qm-layout, .overview-grid, .registry-monitor { grid-template-columns: 1fr; }
@@ -1528,6 +1573,10 @@ HTML = r'''<!DOCTYPE html>
         </div>
         <div style="margin-top:16px;">
           <h4 style="margin-bottom:8px;">Available Domains</h4>
+          <div class="namecheap-toolbar">
+            <span class="namecheap-toolbar-label">Show Filter</span>
+            <div id="namecheapDomainFilters" class="namecheap-filter-chips"></div>
+          </div>
           <div id="namecheapDomainsList" class="notice">Run Try Connection to load domains from the account.</div>
         </div>
       </div>
@@ -1558,6 +1607,8 @@ HTML = r'''<!DOCTYPE html>
         modalMode: null,
         bulkDkimResults: null,
         namecheapDomains: [],
+        namecheapMonitoredDomains: [],
+        namecheapDomainFilter: 'all',
       };
 
       async function apiGetData() {
@@ -1667,6 +1718,7 @@ HTML = r'''<!DOCTYPE html>
             apiKey: '',
             clientIp: '',
             sandbox: false,
+            monitoredDomains: [],
             lastDomains: [],
             lastCheckedAt: '',
           },
@@ -1901,6 +1953,30 @@ HTML = r'''<!DOCTYPE html>
         return { ...defaultData().namecheapConfig, ...(state.data.namecheapConfig || {}) };
       }
 
+      function getNormalizedMonitoredDomains() {
+        return Array.from(new Set((state.namecheapMonitoredDomains || []).map(item => normalizeDomain(item)).filter(Boolean)));
+      }
+
+      function toggleNamecheapDomainMonitoring(domainName) {
+        const normalized = normalizeDomain(domainName || '');
+        if (!normalized) return;
+        const monitored = new Set(getNormalizedMonitoredDomains());
+        if (monitored.has(normalized)) {
+          monitored.delete(normalized);
+          setNamecheapNotice(`Monitoring removed for ${normalized}. Click Save to keep the change.`, 'warn');
+        } else {
+          monitored.add(normalized);
+          setNamecheapNotice(`Monitoring enabled for ${normalized}. Click Save to keep the change.`, 'ok');
+        }
+        state.namecheapMonitoredDomains = Array.from(monitored);
+        renderNamecheapDomains(state.namecheapDomains);
+      }
+
+      function setNamecheapDomainFilter(filterKey = 'all') {
+        state.namecheapDomainFilter = ['all', 'linked', 'available', 'expired', 'monitoring'].includes(filterKey) ? filterKey : 'all';
+        renderNamecheapDomains(state.namecheapDomains);
+      }
+
       function getDomainVerification(domain) {
         return domain?.verification && typeof domain.verification === 'object' ? domain.verification : null;
       }
@@ -1920,31 +1996,88 @@ HTML = r'''<!DOCTYPE html>
 
       function renderNamecheapDomains(domains = []) {
         const list = document.getElementById('namecheapDomainsList');
+        const filters = document.getElementById('namecheapDomainFilters');
         if (!list) return;
+        const linkedDomains = new Set((state.data.domains || []).map(item => normalizeDomain(item.domain || '')));
+        const monitoredDomains = new Set(getNormalizedMonitoredDomains());
+        const normalizedDomains = domains.map(domain => {
+          const nameRaw = normalizeDomain(domain.name || '');
+          const linked = linkedDomains.has(nameRaw);
+          const expired = String(domain.isExpired || '').toLowerCase() === 'true';
+          const autoRenew = String(domain.autoRenew || '').toLowerCase() === 'true';
+          const monitored = monitoredDomains.has(nameRaw);
+          return {
+            ...domain,
+            nameRaw,
+            linked,
+            expired,
+            autoRenew,
+            monitored,
+          };
+        });
+        const filterCounts = {
+          all: normalizedDomains.length,
+          linked: normalizedDomains.filter(domain => domain.linked).length,
+          available: normalizedDomains.filter(domain => !domain.linked && !domain.expired).length,
+          expired: normalizedDomains.filter(domain => domain.expired).length,
+          monitoring: normalizedDomains.filter(domain => domain.monitored).length,
+        };
+        if (filters) {
+          const filterOptions = [
+            ['all', 'All'],
+            ['linked', 'Linked'],
+            ['available', 'Available'],
+            ['expired', 'Expired'],
+            ['monitoring', 'Monitoring'],
+          ];
+          filters.innerHTML = filterOptions.map(([key, label]) => `
+            <button
+              type="button"
+              class="btn-pill ${state.namecheapDomainFilter === key ? 'active' : ''}"
+              data-namecheap-filter="${key}"
+            >${escapeHtml(label)}${filterCounts[key] ? ` (${filterCounts[key]})` : ''}</button>
+          `).join('');
+        }
+        const filteredDomains = normalizedDomains.filter(domain => {
+          if (state.namecheapDomainFilter === 'linked') return domain.linked;
+          if (state.namecheapDomainFilter === 'available') return !domain.linked && !domain.expired;
+          if (state.namecheapDomainFilter === 'expired') return domain.expired;
+          if (state.namecheapDomainFilter === 'monitoring') return domain.monitored;
+          return true;
+        });
         if (!domains.length) {
           list.className = 'notice';
           list.textContent = 'No domains loaded yet.';
           return;
         }
-        const linkedDomains = new Set((state.data.domains || []).map(item => normalizeDomain(item.domain || '')));
+        if (!filteredDomains.length) {
+          list.className = 'notice';
+          list.textContent = 'No domains match the selected filter.';
+          return;
+        }
         list.className = 'pre-box namecheap-domains-list';
-        list.innerHTML = domains.map(domain => {
-          const nameRaw = normalizeDomain(domain.name || '');
-          const name = escapeHtml(nameRaw || '');
+        list.innerHTML = filteredDomains.map(domain => {
+          const name = escapeHtml(domain.nameRaw || '');
           const expires = escapeHtml(domain.expires || '-');
-          const linked = linkedDomains.has(nameRaw);
-          const expired = String(domain.isExpired || '').toLowerCase() === 'true';
-          const autoRenew = String(domain.autoRenew || '').toLowerCase() === 'true';
           return `
             <div class="namecheap-domain-item">
               <div class="namecheap-domain-row">
                 <span class="namecheap-domain-name">${name}</span>
                 <div class="domain-actions">
-                  ${expired ? statusBadge('Expired', 'err') : statusBadge('Active', 'ok')}
-                  ${linked ? statusBadge('Linked', 'ok') : statusBadge('Available', 'muted')}
+                  ${domain.expired ? statusBadge('Expired', 'err') : statusBadge('Active', 'ok')}
+                  ${domain.linked ? statusBadge('Linked', 'ok') : statusBadge('Available', 'muted')}
+                  ${domain.monitored ? statusBadge('Monitoring', 'warn') : ''}
                 </div>
               </div>
-              <div class="namecheap-domain-meta">Expires ${expires}${autoRenew ? ' · Auto renew on' : ''}</div>
+              <div class="namecheap-domain-meta">Expires ${expires}${domain.autoRenew ? ' · Auto renew on' : ''}</div>
+              <div class="namecheap-domain-monitor">
+                <span class="muted">DNS verification can be tracked from the domain workspace after linking.</span>
+                <button
+                  type="button"
+                  class="btn-pill btn-sm ${domain.monitored ? 'active' : ''}"
+                  data-namecheap-monitor="${escapeHtml(domain.nameRaw)}"
+                >${domain.monitored ? 'Monitored' : 'Add Monitoring'}</button>
+              </div>
             </div>
           `;
         }).join('');
@@ -1965,6 +2098,8 @@ HTML = r'''<!DOCTYPE html>
         if (apiKey) apiKey.value = config.apiKey || '';
         if (clientIp) clientIp.value = config.clientIp || '';
         if (sandbox) sandbox.value = config.sandbox ? 'true' : 'false';
+        state.namecheapMonitoredDomains = Array.isArray(config.monitoredDomains) ? config.monitoredDomains : [];
+        state.namecheapDomainFilter = 'all';
         renderNamecheapDomains(domains);
         state.namecheapDomains = domains;
       }
@@ -1977,6 +2112,7 @@ HTML = r'''<!DOCTYPE html>
           apiKey: document.getElementById('namecheapApiKey')?.value.trim() || '',
           clientIp: document.getElementById('namecheapClientIp')?.value.trim() || '',
           sandbox: document.getElementById('namecheapSandbox')?.value === 'true',
+          monitoredDomains: getNormalizedMonitoredDomains(),
           lastDomains: state.namecheapDomains || [],
           lastCheckedAt: new Date().toISOString(),
         };
@@ -2020,6 +2156,7 @@ HTML = r'''<!DOCTYPE html>
         state.namecheapDomains = result.domains || [];
         state.data.namecheapConfig = {
           ...config,
+          monitoredDomains: getNormalizedMonitoredDomains(),
           lastDomains: state.namecheapDomains,
           lastCheckedAt: new Date().toISOString(),
         };
@@ -5411,6 +5548,14 @@ domain-macro gmx gmx.net,gmx.com,gmx.de,gmx.us,mail.com,web.de
             } catch (error) {
               setNamecheapNotice(error.message || 'Failed to save Namecheap config.', 'err');
             }
+            return;
+          }
+          if (e.target.dataset.namecheapFilter) {
+            setNamecheapDomainFilter(e.target.dataset.namecheapFilter);
+            return;
+          }
+          if (e.target.dataset.namecheapMonitor) {
+            toggleNamecheapDomainMonitoring(e.target.dataset.namecheapMonitor);
             return;
           }
           if (e.target.dataset.copyTarget) {
