@@ -5,6 +5,7 @@ from localstorage import (
     NamecheapClient,
     build_domain_verification,
     build_required_namecheap_records,
+    normalize_namecheap_config,
     poll_namecheap_dns,
     upsert_namecheap_record,
 )
@@ -190,6 +191,19 @@ class DomainVerificationTests(unittest.TestCase):
 
 
 class NamecheapPollingTests(unittest.TestCase):
+    def test_normalize_namecheap_config_normalizes_monitored_domains(self):
+        config = normalize_namecheap_config(
+            {
+                "token": "token",
+                "username": "user",
+                "apiKey": "key",
+                "clientIp": "127.0.0.1",
+                "monitoredDomains": [" Example.com ", "", "EXAMPLE.com", "mail.test.io"],
+            }
+        )
+
+        self.assertEqual(["example.com", "mail.test.io"], config["monitoredDomains"])
+
     def test_build_required_namecheap_records_includes_mx_record(self):
         records = build_required_namecheap_records(
             {
