@@ -1188,6 +1188,49 @@ HTML = r'''<!DOCTYPE html>
       white-space: pre-wrap;
       word-break: break-word;
     }
+    .namecheap-domains-list {
+      display: grid;
+      gap: 0;
+      max-height: 280px;
+      overflow-y: auto;
+      padding: 4px 0;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(88,166,255,.55) rgba(255,255,255,.06);
+    }
+    .namecheap-domains-list::-webkit-scrollbar { width: 10px; }
+    .namecheap-domains-list::-webkit-scrollbar-track { background: rgba(255,255,255,.05); border-radius: 999px; }
+    .namecheap-domains-list::-webkit-scrollbar-thumb { background: rgba(88,166,255,.45); border-radius: 999px; }
+    .namecheap-domain-item {
+      display: grid;
+      gap: 6px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(255,255,255,.02);
+    }
+    .namecheap-domain-item + .namecheap-domain-item {
+      margin-top: 0;
+      border-top: 1px solid rgba(255,255,255,.06);
+      border-radius: 0;
+    }
+    .namecheap-domain-item:first-child { border-top-left-radius: 10px; border-top-right-radius: 10px; }
+    .namecheap-domain-item:last-child { border-bottom-left-radius: 10px; border-bottom-right-radius: 10px; }
+    .namecheap-domain-row {
+      display:flex;
+      justify-content:space-between;
+      gap:12px;
+      align-items:center;
+      flex-wrap:wrap;
+    }
+    .namecheap-domain-name {
+      font-weight: 700;
+      letter-spacing: .01em;
+      word-break: break-word;
+    }
+    .namecheap-domain-meta {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
 
     @media (max-width: 1200px) {
       .grid-4, .row, .qm-layout, .overview-grid, .registry-monitor { grid-template-columns: 1fr; }
@@ -1440,7 +1483,7 @@ HTML = r'''<!DOCTYPE html>
   </div>
 
   <div class="modal-overlay" id="namecheapOverlay">
-    <div class="modal">
+    <div class="modal modal-xl">
       <div class="modal-header">
         <div>
           <h3>NameChip Config</h3>
@@ -1884,23 +1927,24 @@ HTML = r'''<!DOCTYPE html>
           return;
         }
         const linkedDomains = new Set((state.data.domains || []).map(item => normalizeDomain(item.domain || '')));
-        list.className = 'pre-box';
+        list.className = 'pre-box namecheap-domains-list';
         list.innerHTML = domains.map(domain => {
           const nameRaw = normalizeDomain(domain.name || '');
           const name = escapeHtml(nameRaw || '');
           const expires = escapeHtml(domain.expires || '-');
           const linked = linkedDomains.has(nameRaw);
           const expired = String(domain.isExpired || '').toLowerCase() === 'true';
+          const autoRenew = String(domain.autoRenew || '').toLowerCase() === 'true';
           return `
-            <div style="padding:8px 0; border-bottom:1px solid rgba(255,255,255,.06);">
-              <div style="display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap;">
-                <strong>${name}</strong>
+            <div class="namecheap-domain-item">
+              <div class="namecheap-domain-row">
+                <span class="namecheap-domain-name">${name}</span>
                 <div class="domain-actions">
                   ${expired ? statusBadge('Expired', 'err') : statusBadge('Active', 'ok')}
                   ${linked ? statusBadge('Linked', 'ok') : statusBadge('Available', 'muted')}
                 </div>
               </div>
-              <div class="muted" style="margin-top:4px;">expires ${expires}${domain.autoRenew === 'true' ? ' · auto renew on' : ''}</div>
+              <div class="namecheap-domain-meta">Expires ${expires}${autoRenew ? ' · Auto renew on' : ''}</div>
             </div>
           `;
         }).join('');
