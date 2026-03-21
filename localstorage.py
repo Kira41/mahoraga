@@ -430,34 +430,35 @@ def upsert_namecheap_record(records: List[Dict[str, str]], new_record: Dict[str,
     new_type = (new_record.get("type") or "").upper()
     new_name = (new_record.get("name") or "").strip().lower()
     new_address = (new_record.get("address") or "").strip()
+    new_mx_pref = str(new_record.get("mx_pref") or "")
 
-    replaced = False
-    for record in records:
+    def matches(record: Dict[str, str]) -> bool:
         record_type = (record.get("type") or "").upper()
         record_name = (record.get("name") or "").strip().lower()
         if record_type != new_type or record_name != new_name:
-            continue
-        if new_type == "MX" and record.get("mx_pref") not in ("", None) and new_record.get("mx_pref") not in ("", None):
-            if str(record.get("mx_pref")) != str(new_record.get("mx_pref")):
-                continue
-        record["address"] = new_address
-        if "ttl" in new_record:
-            record["ttl"] = str(new_record.get("ttl") or "")
-        if "mx_pref" in new_record:
-            record["mx_pref"] = str(new_record.get("mx_pref") or "")
-        replaced = True
-        break
+            return False
+        if new_type != "MX":
+            return True
+        record_pref = str(record.get("mx_pref") or "")
+        return record_pref == new_mx_pref
 
-    if not replaced:
-        records.append(
-            {
-                "name": new_record.get("name", ""),
-                "type": new_type,
-                "address": new_address,
-                "ttl": str(new_record.get("ttl") or ""),
-                "mx_pref": str(new_record.get("mx_pref") or ""),
-            }
-        )
+    preferred_record = {
+        "name": new_record.get("name", ""),
+        "type": new_type,
+        "address": new_address,
+        "ttl": str(new_record.get("ttl") or ""),
+        "mx_pref": new_mx_pref,
+    }
+
+    match_indexes = [index for index, record in enumerate(records) if matches(record)]
+    if not match_indexes:
+        records.append(preferred_record)
+        return
+
+    first_match_index = match_indexes[0]
+    records[first_match_index] = preferred_record
+    for index in reversed(match_indexes[1:]):
+        del records[index]
 
 
 def build_required_namecheap_records(payload: dict) -> List[Dict[str, str]]:

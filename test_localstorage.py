@@ -6,6 +6,7 @@ from localstorage import (
     build_domain_verification,
     build_required_namecheap_records,
     poll_namecheap_dns,
+    upsert_namecheap_record,
 )
 
 
@@ -32,6 +33,27 @@ class NamecheapXmlParsingTests(unittest.TestCase):
         self.assertEqual("A", records[0]["type"])
         self.assertEqual("_dmarc", records[1]["name"])
         self.assertEqual("TXT", records[1]["type"])
+
+
+class NamecheapRecordUpsertTests(unittest.TestCase):
+    def test_upsert_namecheap_record_replaces_duplicate_matching_records(self):
+        records = [
+            {"name": "@", "type": "TXT", "address": "v=spf1 include:legacy.example ~all", "mx_pref": "", "ttl": "60"},
+            {"name": "@", "type": "TXT", "address": "v=spf1 include:older.example ~all", "mx_pref": "", "ttl": "120"},
+            {"name": "mail", "type": "A", "address": "203.0.113.10", "mx_pref": "", "ttl": "1800"},
+        ]
+
+        upsert_namecheap_record(
+            records,
+            {"name": "@", "type": "TXT", "address": "v=spf1 ip4:217.154.172.143 ~all", "mx_pref": "", "ttl": "1800"},
+        )
+
+        self.assertEqual(2, len(records))
+        self.assertEqual(
+            [record for record in records if record["name"] == "@" and record["type"] == "TXT"],
+            [{"name": "@", "type": "TXT", "address": "v=spf1 ip4:217.154.172.143 ~all", "ttl": "1800", "mx_pref": ""}],
+        )
+        self.assertEqual({"name": "mail", "type": "A", "address": "203.0.113.10", "mx_pref": "", "ttl": "1800"}, records[1])
 
 
 class DomainVerificationTests(unittest.TestCase):
